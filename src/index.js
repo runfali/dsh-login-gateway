@@ -30,8 +30,8 @@ const SWEEP_INTERVAL = 30 * 60_000
 
 /**
  * 浏览器自动请求的静态小资源（PWA manifest / favicon / robots.txt）：
- * 浏览器这些请求默认不带 Cookie，未登录时门卫按 401 处理会在控制台持续报错。
- * 未登录时对这些路径返回 204 空响应；已登录走正常反代。
+ * 浏览器这些请求默认不带 Cookie。纯静态元数据无敏感信息，未登录也直接放行反代，
+ * 保证标签页图标与 PWA 可安装；已登录走正常反代。
  */
 const AUTO_RESOURCE_PATHS = new Set([
   '/manifest.webmanifest',
@@ -282,12 +282,10 @@ export function apply(ctx, config = {}) {
       return
     }
 
-    // 浏览器自动请求资源：未登录返回 204（manifest/favicon 请求不带 Cookie，避免控制台 401 报错）；已登录走正常反代
+    // 浏览器自动请求的纯静态元数据（manifest/favicon/robots.txt，无敏感信息）：
+    // 未登录也直接放行反代——否则标签页无图标、PWA 不可安装（请求不带 Cookie 属正常）
     if (!session && AUTO_RESOURCE_PATHS.has(pathname)) {
-      sendSecurityHeaders(res)
-      res.writeHead(204)
-      res.end()
-      return
+      return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs)
     }
 
     if (!session) {

@@ -34,6 +34,19 @@ function stripHopByHop(headers) {
 }
 
 /**
+ * 非安全上下文（http:// 非 localhost 等）浏览器不提供 crypto.randomUUID
+ * （undefined），但 getRandomValues 可用；注入真随机 UUID v4 polyfill。
+ */
+const POLYFILL_TAG = '<script>(function(){if(typeof crypto!==\'undefined\'&&typeof crypto.randomUUID!==\'function\'){crypto.randomUUID=function(){var b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&0x0f)|0x40;b[8]=(b[8]&0x3f)|0x80;var h=\'\';for(var i=0;i<16;i++){h+=(b[i]<16?\'0\':\'\')+b[i].toString(16);if(i===3||i===5||i===7||i===9)h+=\'-\';}return h;};}})();</script>'
+
+/** 在 </head> 前注入 polyfill（无 </head> 则 </body> 前，都没有则追加末尾）。 */
+function injectPolyfill(html) {
+  if (html.includes('</head>')) return html.replace('</head>', `${POLYFILL_TAG}</head>`)
+  if (html.includes('</body>')) return html.replace('</body>', `${POLYFILL_TAG}</body>`)
+  return html + POLYFILL_TAG
+}
+
+/**
  * HTTP 反代：流式透传（SSE 等长连接天然支持）。
  * 请求头等待阶段用 proxyTimeoutMs 空闲超时（上游挂起 -> 504）；
  * 响应头到达后清除该超时，改用 streamIdleTimeoutMs 大空闲超时
@@ -65,6 +78,31 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
       upRes.on('end', cleanup)
       upRes.on('close', cleanup)
     }
+
+    // HTML 响应（dsh index.html 仅 ~12KB）：缓冲后注入 randomUUID polyfill
+    const contentType = String(upRes.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+    if (contentType === 'text/html') {
+      const chunks = []
+      upRes.on('data', (c) => chunks.push(c))
+      upRes.on('error', () => {
+        if (!res.headersSent) {
+          res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end('bad gateway')
+        } else {
+          res.destroy()
+        }
+      })
+      upRes.on('end', () => {
+        const injected = injectPolyfill(Buffer.concat(chunks).toString('utf8'))
+        const outHeaders = stripHopByHop(upRes.headers)
+        delete outHeaders['content-length']
+        res.writeHead(upRes.statusCode ?? 502, outHeaders)
+        res.end(injected)
+      })
+      return
+    }
+
+    // 其他 Content-Type（SSE text/event-stream、json 等）：流式透传不缓冲
     res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
     upRes.pipe(res)
   })

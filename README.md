@@ -1,102 +1,166 @@
 # dsh-login-gateway
 
-DeepSeek Harness（dsh）登录门卫插件：为 dsh Web UI 提供受密码保护的外部访问入口。
+DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监听 `127.0.0.1:3080`，禁止外部访问；本插件在外部再开一个入口（默认 `0.0.0.0:3081`），访问者先通过**用户名密码登录**，登录成功后流量被**全量反向代理**到 dsh 的 Web UI（HTTP 与 WebSocket 都支持），功能零缺失。
 
-dsh Web UI 只监听 `127.0.0.1:3080`，禁止外部访问。本插件随 dsh 启动，额外监听
-`0.0.0.0:3081`：未登录时返回中文登录页，已登录后把请求**全量反代**到
-`127.0.0.1:3080`（HTTP 与 WebSocket 均支持），功能零缺失。
+零运行时依赖（只用 Node.js 内置模块），Node 22+ ESM。
 
-## 架构
+---
+
+## 它解决什么问题
+
+- 想从局域网/公网访问本机 dsh，但 dsh 只监听 loopback；
+- 直接改 dsh 让它监听 `0.0.0.0` 会裸奔在公网上，任何人可访问；
+- 本插件：外部入口 + 登录墙 + 反代，dsh 本身保持零侵入（继续只听 127.0.0.1）。
+
+## 工作架构
 
 ```
-外部浏览器 ──► 本插件 0.0.0.0:3081  ──► 127.0.0.1:3080 (dsh Web UI)
-              ├─ GET / 未登录  → 中文登录页
-              ├─ POST /login   → 校验密码，发放会话 Cookie
-              ├─ POST /logout  → 删除会话，跳回登录页
-              ├─ 其余路径未登录 → 401 JSON
-              └─ 已登录（含 WS）→ 全量反代
+浏览器 ──HTTP/WS──▶ 0.0.0.0:3081（门卫：登录校验 + 会话 Cookie）
+                         │ 通过校验后全量反代（改写 Host/Origin/Sec-Fetch-Site 为 loopback 形态）
+                         ▼
+                    127.0.0.1:3080（dsh Web UI，信任围栏放行，特权 API 全可用）
 ```
 
-- 会话 Cookie：`dsh_gw_session`，`HttpOnly + SameSite=Strict + Path=/`
-- 会话存储：内存 Map，支持过期清理（每 60 秒 sweep 一次）
-- 登录限速：同一 IP 连续失败达到上限后临时锁定，防止暴力破解
-- 密码哈希：scrypt（格式 `scrypt$N$r$p$salt$hash`，自描述、换参兼容）
-- 反代关键点：改写 `Host / Origin / Sec-Fetch-Site` 为 loopback 形态，使 dsh 的
-  trust fence 放行，仅限 loopback 的特权接口（settings/credentials 等）也全部可用
+关键点：反代时把请求头里的 `Host`/`Origin`/`Sec-Fetch-Site` 改写为 loopback 形态，让 dsh 把请求当作"本机请求"信任放行；WebSocket 升级请求同样先校验会话再转发。
 
-## 文件结构
+## 快速开始（首次安装）
 
-| 文件 | 说明 |
-| --- | --- |
-| `src/index.js` | 插件主入口（`name` + `apply(ctx, config)`），路由分发与服务生命周期 |
-| `src/auth.js` | 密码哈希、会话存储（SessionStore）、登录限速（LoginLimiter） |
-| `src/proxy.js` | HTTP 反代与 WebSocket 升级转发（含头改写、逐跳头剔除） |
-| `src/login-page.js` | 中文深色登录页（单文件、内联 CSS/JS、无外部资源） |
-| `bin/hash.js` | 密码哈希生成 CLI |
+1. 把本项目放到 dsh 服务器上（例如 `/data/dsh-login-gateway`），并安装依赖（仅 devDependencies，运行时无依赖）：
 
-零运行时依赖，仅使用 Node.js 内置模块（`node:http`、`node:crypto`、`node:stream`）。
+   ```bash
+   cd /data/dsh-login-gateway
+   npm install
+   ```
+
+2. 在 dsh 的 profile 配置里挂载插件（编辑 `cordis.patch.yml`，见下节"部署步骤"），重启 dsh。
+
+3. **获取一次性初始化令牌**（二选一）：
+
+   - **a) dsh 启动终端的输出**：插件会直接往进程 stdout 打印一行（不走日志服务，dsh 启动的终端里就能看到）：
+
+     ```
+     [login-gateway] 登录门卫未初始化，请访问 http://<主机>:3081/setup 并输入一次性令牌：XXXX-XXXX
+     ```
+
+   - **b) 读取令牌文件**：令牌同时写在用户文件同目录下的 `setup-token.txt`（权限 0600，内容仅令牌本身）：
+
+     ```bash
+     cat ~/.dsh-login-gateway/setup-token.txt
+     ```
+
+4. 浏览器打开 `http://<主机>:3081/setup`，输入令牌、管理员用户名、密码（至少 8 位）与确认密码，点击"完成设置"。
+
+5. 跳转到登录页，用刚创建的账号登录，即可进入 dsh。
+
+> 说明：令牌只在**未初始化**时生成；初始化完成后 `/setup` 会返回 410，`setup-token.txt` 也会被自动删除。
 
 ## 配置项
 
-`config` 字段来自 `cordis.patch.yml`，全部可省略（有默认值），`users` 必填。
+所有配置都有缺省值，只有 `users`（可选）需要在确实要"从配置写死初始账号"时才填写。完整配置表：
 
-| 配置项 | 类型 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `listenHost` | string | `0.0.0.0` | 外部监听地址 |
-| `listenPort` | number | `3081` | 外部监听端口（1-65535） |
-| `targetHost` | string | `127.0.0.1` | dsh 反代目标地址 |
-| `targetPort` | number | `3080` | dsh 反代目标端口 |
-| `sessionTtlHours` | number | `24` | 会话有效期（小时） |
-| `maxLoginAttempts` | number | `5` | 同一 IP 允许的连续失败次数 |
-| `lockMinutes` | number | `5` | 超过失败次数后的锁定时长（分钟） |
-| `users` | array | 必填 | 登录用户列表，每项为 `{ username, passwordHash }` |
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `listenHost` | `0.0.0.0` | 门卫监听地址，暴露给外部 |
+| `listenPort` | `3081` | 门卫监听端口 |
+| `targetHost` | `127.0.0.1` | dsh Web UI 监听地址 |
+| `targetPort` | `3080` | dsh Web UI 监听端口 |
+| `sessionTtlHours` | `24` | 登录会话有效期（小时） |
+| `maxLoginAttempts` | `5` | 同一 IP 连续失败多少次后锁定 |
+| `lockMinutes` | `5` | 锁定持续分钟数 |
+| `userStorePath` | `~/.dsh-login-gateway/users.json` | 用户数据文件路径（可自定义） |
+| `users` | 无（可选） | 种子用户数组 `[{ username, passwordHash }]`，仅当用户文件不存在时写入并采用 |
 
-非法配置（缺少 `users`、端口越界等）会在加载插件时直接抛错，阻止启动。
+### `users` 种子配置（可选，向后兼容）
 
-## 部署步骤
+首次安装不想走 `/setup` 引导的话，可以直接在配置里写死初始账号：
 
-1. 生成密码哈希：
+```yaml
+config:
+  users:
+    - username: admin
+      passwordHash: 'scrypt$16384$8$1$...'   # 用下面的工具生成
+```
 
-   ```bash
-   node bin/hash.js '你的密码'
-   # 或全局安装后：dsh-login-gateway-hash '你的密码'
-   ```
+生成哈希：
 
-2. 在 `cordis.patch.yml` 中注册插件并写入配置：
+```bash
+npx dsh-login-gateway-hash "你的密码"
+# 或直接运行
+node bin/hash.js "你的密码"
+```
 
-   ```yaml
-   plugins:
-     login-gateway:
-       config:
-         listenHost: 0.0.0.0
-         listenPort: 3081
-         targetHost: 127.0.0.1
-         targetPort: 3080
-         sessionTtlHours: 24
-         maxLoginAttempts: 5
-         lockMinutes: 5
-         users:
-           - username: admin
-             passwordHash: "scrypt$16384$8$1$...."
-   ```
+> 种子只在**用户文件不存在**时写入文件并采用。一旦 `/setup` 创建过账号或文件已存在，改 `users` 配置不再生效——请直接编辑 `users.json` 文件。
 
-   （`passwordHash` 用第 1 步的输出替换）
+## 部署步骤（cordis.patch.yml）
 
-3. 确保 dsh 能 `import` 本项目的 `src/index.js` 加载插件，然后重启 dsh。
+在 dsh 的 profile 目录（如 `/root/.dsh/profiles/web/`）的 `cordis.patch.yml` 中追加挂载项：
+
+```yaml
+- insert:
+    - id: login-gateway
+      name: '/data/dsh-login-gateway/src/index.js'
+      config:
+        listenHost: '0.0.0.0'
+        listenPort: 3081
+        targetHost: '127.0.0.1'
+        targetPort: 3080
+        sessionTtlHours: 24
+        maxLoginAttempts: 5
+        lockMinutes: 5
+        # 首次安装可不配 users，改用 /setup 引导创建管理员账号
+        # users:
+        #   - username: admin
+        #     passwordHash: 'scrypt$16384$8$1$...'
+```
+
+保存后重启 dsh，或使用 dsh 的热重载功能。
 
 ## 使用说明
 
-- 浏览器访问 `http://<服务器IP>:3081`，未登录时显示登录页
-- 输入用户名密码登录成功后自动跳转进入 dsh Web 控制台
-- 登录页与所有响应均为中文；`/logout` 会清除会话并跳回登录页
-- WebSocket（终端等实时通道）同样需要已登录会话，未登录会返回 401 并断开
+- **登录**：打开 `http://<主机>:3081/`，输入用户名密码。成功后会种下会话 Cookie（`dsh_gw_session`，HttpOnly + SameSite=Strict），之后访问全部走反代，包括 WebSocket。
+- **登出**：`POST /logout`（页面无入口时为 `curl -X POST http://<主机>:3081/logout`），会清除会话并跳回登录页。
+- **未登录访问**：`/` 返回登录页；其余路径返回 `401` JSON。
+- **限速**：同一 IP 连续输错 `maxLoginAttempts` 次会被锁定 `lockMinutes` 分钟，期间该 IP 登录一律 401 并提示锁定。
 
 ## 安全说明
 
-- 密码使用 scrypt 加盐哈希存储，仅在服务端保存哈希，不保存明文
-- 会话 Cookie 仅限 HttpOnly + SameSite=Strict，防止 XSS 窃取与 CSRF 利用
-- 登录接口限流：同一 IP 连续失败 `maxLoginAttempts` 次后锁定 `lockMinutes` 分钟
-- 用户不存在时同样执行一次 scrypt 校验，避免通过响应耗时枚举用户名
-- `/login` 请求体限制 10KB，防止超大请求拖垮服务
-- 会话与限速记录保存在内存中，重启后失效（即：重启后所有人需重新登录）
-- 本插件只是访问门卫，建议同时开启系统级防火墙，仅放行必要来源访问 3081 端口
+- **务必走 HTTPS**：门卫本身只做 HTTP 登录 + 反代，公网直接暴露明文账号密码与流量有风险。建议在前面挂 Nginx/Caddy/云负载均衡做 TLS 终止（例如 443 → 127.0.0.1:3081）。
+- **会话 Cookie** 使用 `HttpOnly` + `SameSite=Strict`，页面无 XSS 注入点。
+- **一次性令牌**只在未初始化时有效，初始化后即失效；`setup-token.txt`（0600）只含令牌本身，初始化完成后自动删除。
+- **用户文件**默认在 `~/.dsh-login-gateway/users.json`，内含 scrypt 哈希（不可逆）。建议确保该文件权限仅当前用户可读写：`chmod 600 ~/.dsh-login-gateway/users.json`。
+- 登录/初始化接口有请求体大小上限（100KB），防止恶意超大请求。
+
+## 重置与常见问题
+
+- **重置管理员账号**：删除用户文件后重启 dsh，会再次进入"未初始化"状态，重新打印一次性令牌，走 `/setup` 重新创建：
+
+  ```bash
+  rm -f ~/.dsh-login-gateway/users.json
+  ```
+
+- **忘记/没看到一次性令牌**：两种获取方式——a) 看 dsh 启动终端的 stdout 输出里 `[login-gateway] 登录门卫未初始化...` 那一行；b) 读取令牌文件：`cat ~/.dsh-login-gateway/setup-token.txt`。若两者都没有（例如服务已运行多时、文件被删），删掉用户文件重启 dsh 会重新生成令牌（见上）。
+- **`/setup` 返回 410**：说明已初始化完成，设置入口已关闭，属正常现象。如需重新初始化，先删用户文件重启。
+- **访问 `http://<主机>:3081/` 打不开**：检查 dsh 是否已启动、插件挂载是否生效（看日志是否打印"外部入口已启动"）、端口是否被防火墙拦截。
+- **登录后页面/接口 502**：门卫反代目标 `127.0.0.1:3080` 不可达，确认 dsh 的 Web UI 进程在运行。
+- **用户文件损坏**：启动会直接报错并给出文件路径（不会静默重置）。按上面的"重置方法"处理。
+
+## 技术实现
+
+- 认证：`node:crypto` scrypt（`scrypt$N$r$p$salt$hash` 自描述格式），恒定时间比较防时序攻击。
+- 会话：内存 `Map` + 过期清理（30 分钟定时 sweep）。
+- 反代：流式透传（SSE 长连接友好），剔除 hop-by-hop 头，WebSocket 升级用后端 `rawHeaders` 原样构造 101 响应。
+- 零运行时依赖，所有依赖仅存在于开发/测试环境。
+
+## 目录结构
+
+```
+src/
+  index.js        插件主入口：配置校验、路由分发、setup 引导、HTTP 服务 + WS 升级
+  auth.js         密码哈希（scrypt）、会话存储、登录限速
+  proxy.js        HTTP 反代（头改写 + hop-by-hop 剔除）与 WebSocket 升级转发
+  user-store.js   用户文件存储（JSON + 原子写入）
+  login-page.js   登录页 HTML（深色主题，单文件内联）
+  setup-page.js   首次启动引导页 HTML（深色主题，单文件内联）
+bin/
+  hash.js         密码哈希生成 CLI
+```

@@ -46,6 +46,7 @@ export function proxyRequest(req, res, targetHost, targetPort) {
     method: req.method,
     path: req.url,
     headers,
+    agent: false,
   }, (upRes) => {
     res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
     upRes.pipe(res)
@@ -79,6 +80,7 @@ export function proxyUpgrade(req, socket, head, targetHost, targetPort) {
     method: 'GET',
     path: req.url,
     headers,
+    agent: false,
   })
 
   upstream.on('upgrade', (upRes, upSocket, upHead) => {
@@ -93,8 +95,17 @@ export function proxyUpgrade(req, socket, head, targetHost, targetPort) {
     if (upHead.length > 0) socket.write(upHead)
     upSocket.pipe(socket)
     socket.pipe(upSocket)
-    socket.on('error', () => upSocket.destroy())
-    upSocket.on('error', () => socket.destroy())
+    // 任一侧关闭/报错/收到 FIN，都完整拆除两端，避免半开连接泄漏
+    const teardown = () => {
+      upSocket.destroy()
+      socket.destroy()
+    }
+    socket.on('error', teardown)
+    upSocket.on('error', teardown)
+    socket.on('close', teardown)
+    upSocket.on('close', teardown)
+    socket.on('end', teardown)
+    upSocket.on('end', teardown)
   })
 
   upstream.on('error', () => {

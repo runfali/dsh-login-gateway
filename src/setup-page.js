@@ -1,13 +1,14 @@
 /**
- * dsh-login-gateway 登录页（中文、深色主题、单文件内联 CSS/JS，零外部资源）。
- * 表单 AJAX POST /login：成功刷新到 /（已登录后走反代），失败在页内显示服务端错误。
+ * dsh-login-gateway 首次启动引导页（中文、深色主题，与登录页一致风格）。
+ * 字段：一次性令牌、用户名、密码、确认密码；fetch POST /setup，
+ * 成功跳转 /（登录页），失败在页内显示服务端错误。
  */
-export const loginPageHtml = `<!doctype html>
+export const setupPageHtml = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>登录 - dsh</title>
+<title>初始化设置 - dsh 登录门卫</title>
 <style>
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
@@ -17,11 +18,11 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 .card {
-  width: min(92vw, 380px); background: #0f1011; border: 1px solid #23252a;
+  width: min(92vw, 420px); background: #0f1011; border: 1px solid #23252a;
   border-radius: 12px; padding: 36px 32px;
 }
 h1 { margin: 0 0 6px; font-size: 22px; font-weight: 600; letter-spacing: -0.4px; }
-.sub { margin: 0 0 24px; font-size: 14px; color: #8a8f98; }
+.sub { margin: 0 0 24px; font-size: 14px; color: #8a8f98; line-height: 1.6; }
 label { display: block; font-size: 13px; color: #d0d6e0; margin-bottom: 14px; }
 input {
   width: 100%; margin-top: 6px; padding: 10px 12px; font-size: 14px; color: #f7f8f8;
@@ -39,21 +40,27 @@ button:disabled { opacity: 0.5; cursor: default; }
 </head>
 <body>
 <main class="card">
-  <h1>dsh 登录</h1>
-  <p class="sub">请输入用户名和密码以继续访问</p>
-  <form id="login-form" autocomplete="on">
+  <h1>初始化设置</h1>
+  <p class="sub">首次使用请先创建管理员账号。一次性令牌显示在启动日志中，请先登录服务器查看。</p>
+  <form id="setup-form" autocomplete="off">
+    <label>一次性令牌
+      <input id="token" name="token" autocomplete="off" required>
+    </label>
     <label>用户名
-      <input id="username" name="username" autocomplete="username" required>
+      <input id="username" name="username" autocomplete="off" maxlength="64" required>
     </label>
-    <label>密码
-      <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <label>密码（至少 8 位）
+      <input id="password" name="password" type="password" autocomplete="new-password" required>
     </label>
-    <button type="submit">登 录</button>
+    <label>确认密码
+      <input id="password2" name="password2" type="password" autocomplete="new-password" required>
+    </label>
+    <button type="submit">完成设置</button>
   </form>
   <p id="error" class="error" role="alert"></p>
 </main>
 <script>
-const form = document.getElementById('login-form')
+const form = document.getElementById('setup-form')
 const error = document.getElementById('error')
 const btn = form.querySelector('button')
 form.addEventListener('submit', async (e) => {
@@ -61,19 +68,21 @@ form.addEventListener('submit', async (e) => {
   error.textContent = ''
   btn.disabled = true
   try {
-    const res = await fetch('/login', {
+    const res = await fetch('/setup', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        username: document.getElementById('username').value,
+        token: document.getElementById('token').value.trim(),
+        username: document.getElementById('username').value.trim(),
         password: document.getElementById('password').value,
+        password2: document.getElementById('password2').value,
       }),
     })
     const data = await res.json().catch(() => ({}))
     if (res.ok && data.ok) window.location.href = '/'
-    else error.textContent = data.error || '登录失败，请稍后重试'
+    else error.textContent = data.error || '设置失败，请重试'
   } catch {
-    error.textContent = '网络错误，请稍后重试'
+    error.textContent = '网络错误，请重试'
   } finally {
     btn.disabled = false
   }

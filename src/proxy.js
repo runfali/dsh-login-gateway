@@ -35,11 +35,15 @@ function stripHopByHop(headers) {
 
 /**
  * HTTP 反代：流式透传（SSE 等长连接天然支持）。
+ * 请求头等待阶段用 proxyTimeoutMs 空闲超时（上游挂起 -> 504）；
+ * 响应头到达后清除该超时，改用 streamIdleTimeoutMs 大空闲超时
+ * （SSE 长思考间隙不被打断，仅长时间无数据才断开防死连接）。
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
- * @param {number} [proxyTimeoutMs] 上游无响应超时（毫秒），默认 60000
+ * @param {number} [proxyTimeoutMs] 上游响应头等待超时（毫秒），默认 60000
+ * @param {number} [streamIdleTimeoutMs] 响应流空闲超时（毫秒），默认 30 分钟
  */
-export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 60_000) {
+export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 60_000, streamIdleTimeoutMs = 30 * 60_000) {
   const headers = rewriteHeaders(req.headers, targetHost, targetPort)
   const upstream = http.request({
     host: targetHost,
@@ -49,6 +53,18 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
     headers,
     agent: false,
   }, (upRes) => {
+    // 响应头已到达：清掉请求头等待期的空闲超时，改对响应流设大的空闲超时
+    upstream.setTimeout(0)
+    const sock = upRes.socket
+    if (sock) {
+      sock.setTimeout(streamIdleTimeoutMs, () => {
+        upRes.destroy()
+        if (!res.destroyed) res.destroy()
+      })
+      const cleanup = () => sock.setTimeout(0)
+      upRes.on('end', cleanup)
+      upRes.on('close', cleanup)
+    }
     res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
     upRes.pipe(res)
   })

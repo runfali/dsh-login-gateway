@@ -139,6 +139,7 @@ export function apply(ctx, config = {}) {
     setupMaxAttempts: config.setupMaxAttempts ?? 5,
     setupLockMinutes: config.setupLockMinutes ?? 30,
     proxyTimeoutMs: config.proxyTimeoutMs ?? 60_000,
+    streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 1800_000,
     maxConnections: config.maxConnections ?? 512,
     userStorePath: config.userStorePath ?? path.join(os.homedir(), '.dsh-login-gateway', 'users.json'),
   }
@@ -271,7 +272,7 @@ export function apply(ctx, config = {}) {
       if (pathname === '/') return sendHtml(res, 200, loginPageHtml)
       return sendJson(res, 401, { error: '未登录，请先访问 / 登录' })
     }
-    return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs)
+    return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs)
   }
 
   const server = http.createServer((req, res) => {

@@ -69,7 +69,8 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
 | `lockMinutes` | `5` | 锁定持续分钟数 |
 | `setupMaxAttempts` | `5` | `/setup` 初始化：同一 IP 连续失败多少次后锁定 |
 | `setupLockMinutes` | `30` | `/setup` 初始化锁定持续分钟数 |
-| `proxyTimeoutMs` | `60000` | 反代上游（dsh）无响应超时（毫秒）；WS 握手超时取与 15s 的较小值 |
+| `proxyTimeoutMs` | `60000` | 反代上游响应头等待超时（毫秒），超时返回 504；WS 握手超时取与 15s 的较小值 |
+| `streamIdleTimeoutMs` | `1800000` | 反代响应流空闲超时（毫秒，默认 30 分钟）：响应头到达后 SSE 等长思考间隙不被 60s 请求超时打断，仅长时间无数据才断开 |
 | `maxConnections` | `512` | HTTP 服务最大并发连接数，超出后新连接被丢弃 |
 | `userStorePath` | `~/.dsh-login-gateway/users.json` | 用户数据文件路径（可自定义） |
 | `users` | 无（可选） | 种子用户数组 `[{ username, passwordHash }]`，仅当用户文件不存在时写入并采用 |
@@ -135,7 +136,7 @@ node bin/hash.js "你的密码"
 - **一次性令牌**为 32 位随机十六进制（连字符分组展示，128 bit 熵），只在未初始化时有效，初始化后即失效；`setup-token.txt`（0600）只含令牌本身，初始化完成后自动删除。
 - **用户文件**默认在 `~/.dsh-login-gateway/users.json`，内含 scrypt 哈希（不可逆）。写入时自动使用 0600 权限、目录自动 0700，无需手工 `chmod`。
 - **登录/初始化限速**按来源 IP 与用户名双维度独立计算：初始化入口 `/setup` 在未初始化阶段暴露（默认 `0.0.0.0`），连续失败会被锁定并返回 429，防止分布式暴力猜测令牌抢占管理员账号；登录失败记录带 TTL（30 分钟未命中自动清理），防止内存膨胀。
-- **反代超时**：上游 dsh 无响应超 `proxyTimeoutMs`（默认 60s）返回 504，WS 握手超时不超过 15s；502/504 响应体为固定文案（`bad gateway`/`gateway timeout`），不泄漏内部错误信息。
+- **反代超时**：上游 dsh 响应头等待超 `proxyTimeoutMs`（默认 60s）返回 504，WS 握手超时不超过 15s；响应头到达后改用 `streamIdleTimeoutMs`（默认 30 分钟）空闲超时——AI 流式输出（SSE）的长思考间隙（>60s）不会被打断；502/504 响应体为固定文案（`bad gateway`/`gateway timeout`），不泄漏内部错误信息。
 - **并发连接上限**：`maxConnections`（默认 512）限制最大并发连接数；`headersTimeout` 15s、`requestTimeout` 30s、`keepAliveTimeout` 5s 显式收紧（Node 默认 60s），防 slowloris 慢速攻击与连接堆积耗尽资源。
 - **安全响应头**：门卫自己生成的响应（登录页/引导页/JSON/302/401/410/429/405/500）统一带 `X-Frame-Options: DENY`（防 iframe 点击劫持/钓鱼）、`Referrer-Policy: no-referrer`、`Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'`（登录页/引导页为内联样式+内联脚本）。反代透传的 dsh 响应**不加**这些头，保持原样。
 - 登录/初始化接口有请求体大小上限（100KB），防止恶意超大请求。

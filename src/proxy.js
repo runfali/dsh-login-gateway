@@ -39,11 +39,39 @@ function stripHopByHop(headers) {
  */
 const POLYFILL_TAG = '<script>(function(){if(typeof crypto!==\'undefined\'&&typeof crypto.randomUUID!==\'function\'){crypto.randomUUID=function(){var b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&0x0f)|0x40;b[8]=(b[8]&0x3f)|0x80;var h=\'\';for(var i=0;i<16;i++){h+=(b[i]<16?\'0\':\'\')+b[i].toString(16);if(i===3||i===5||i===7||i===9)h+=\'-\';}return h;};}})();</script>'
 
-/** 在 </head> 前注入 polyfill（无 </head> 则 </body> 前，都没有则追加末尾）。 */
-function injectPolyfill(html) {
-  if (html.includes('</head>')) return html.replace('</head>', `${POLYFILL_TAG}</head>`)
-  if (html.includes('</body>')) return html.replace('</body>', `${POLYFILL_TAG}</body>`)
-  return html + POLYFILL_TAG
+/**
+ * 悬浮"退出"按钮：dsh 页面无登出入口，门卫在反代 HTML 时注入。
+ * 独立元素 id=dsh-gw-logout-btn，只创建自身不碰其他 DOM；
+ * 点击 confirm 后 POST /logout（门卫接口）并跳转登录页。
+ */
+const LOGOUT_BUTTON_TAG = `<script>
+(function(){
+  var mount = function(){
+    var b = document.createElement('button')
+    b.id = 'dsh-gw-logout-btn'
+    b.title = '退出登录'
+    b.textContent = '退出'
+    b.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:6px 14px;font-size:13px;color:#fff;background:rgba(15,16,17,0.8);border:1px solid #2a2c33;border-radius:8px;cursor:pointer;transition:background 0.2s;'
+    b.onmouseenter = function(){ b.style.background = 'rgba(40,44,54,0.9)' }
+    b.onmouseleave = function(){ b.style.background = 'rgba(15,16,17,0.8)' }
+    b.onclick = function(){
+      if (!confirm('确定退出登录吗？')) return
+      fetch('/logout', { method: 'POST' }).finally(function(){ window.location.href = '/' })
+    }
+    document.body.appendChild(b)
+  }
+  if (document.body) mount()
+  else document.addEventListener('DOMContentLoaded', mount)
+})();
+</script>`
+
+const INJECT_TAGS = POLYFILL_TAG + LOGOUT_BUTTON_TAG
+
+/** 在 </head> 前注入脚本（无 </head> 则 </body> 前，都没有则追加末尾）。 */
+function injectTags(html) {
+  if (html.includes('</head>')) return html.replace('</head>', `${INJECT_TAGS}</head>`)
+  if (html.includes('</body>')) return html.replace('</body>', `${INJECT_TAGS}</body>`)
+  return html + INJECT_TAGS
 }
 
 /**
@@ -93,7 +121,7 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
         }
       })
       upRes.on('end', () => {
-        const injected = injectPolyfill(Buffer.concat(chunks).toString('utf8'))
+        const injected = injectTags(Buffer.concat(chunks).toString('utf8'))
         const outHeaders = stripHopByHop(upRes.headers)
         delete outHeaders['content-length']
         res.writeHead(upRes.statusCode ?? 502, outHeaders)

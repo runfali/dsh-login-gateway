@@ -73,31 +73,51 @@ export class SessionStore {
   }
 }
 
-/** 登录失败限速：同一 IP 连续失败达到上限后锁定一段时间。 */
+const RECORD_TTL_MS = 30 * 60_000
+
+/**
+ * 登录失败限速：IP 与用户名两个维度独立计数，任一达到上限即锁定。
+ * 防分布式攻击：代理池打 /login 时每 IP 次数少，但同一用户名跨 IP 累计仍会锁定。
+ */
 export class LoginLimiter {
-  constructor(maxAttempts, lockMs) {
+  constructor(maxAttempts, lockMs, recordTtlMs = RECORD_TTL_MS) {
     this.maxAttempts = maxAttempts
     this.lockMs = lockMs
-    this.records = new Map() // ip -> { failures, lockedUntil }
+    this.recordTtlMs = recordTtlMs
+    this.records = new Map() // ip -> { failures, lockedUntil, lastSeen }
+    this.usernameRecords = new Map() // username -> { failures, lockedUntil, lastSeen }
   }
 
-  /** 该 IP 当前是否被锁定。 */
-  isLocked(ip) {
-    const rec = this.records.get(ip)
+  _locked(map, key) {
+    const rec = map.get(key)
     if (!rec) return false
     if (rec.lockedUntil && rec.lockedUntil > Date.now()) return true
-    if (rec.lockedUntil) this.records.delete(ip)
+    if (rec.lockedUntil) map.delete(key)
     return false
   }
 
-  /** 记录一次失败，返回剩余可尝试次数（<=0 表示已锁定）。 */
-  recordFailure(ip) {
-    const now = Date.now()
-    let rec = this.records.get(ip)
+  /** 返回锁定的维度：'ip' | 'username' | 'both' | null（不传 username 时只查 IP）。 */
+  lockedBy(ip, username) {
+    const ipLocked = this._locked(this.records, ip)
+    const userLocked = username ? this._locked(this.usernameRecords, username) : false
+    if (ipLocked && userLocked) return 'both'
+    if (ipLocked) return 'ip'
+    if (userLocked) return 'username'
+    return null
+  }
+
+  /** 任一维度锁定即锁定。 */
+  isLocked(ip, username) {
+    return this.lockedBy(ip, username) !== null
+  }
+
+  _recordFail(map, key, now) {
+    let rec = map.get(key)
     if (!rec || (rec.lockedUntil && rec.lockedUntil <= now)) {
-      rec = { failures: 0, lockedUntil: 0 }
-      this.records.set(ip, rec)
+      rec = { failures: 0, lockedUntil: 0, lastSeen: now }
+      map.set(key, rec)
     }
+    rec.lastSeen = now
     rec.failures += 1
     if (rec.failures >= this.maxAttempts) {
       rec.lockedUntil = now + this.lockMs
@@ -107,8 +127,31 @@ export class LoginLimiter {
     return this.maxAttempts - rec.failures
   }
 
-  /** 登录成功后清除记录。 */
-  reset(ip) {
+  /** 记录一次失败（IP 必记；提供 username 时用户名维度也记），返回剩余可尝试次数（<=0 表示已锁定）。 */
+  recordFailure(ip, username) {
+    const now = Date.now()
+    let remaining = this._recordFail(this.records, ip, now)
+    if (username) {
+      remaining = Math.min(remaining, this._recordFail(this.usernameRecords, username, now))
+    }
+    return remaining
+  }
+
+  /** 登录成功后清除记录（IP 必清；提供 username 时用户名维度也清）。 */
+  reset(ip, username) {
     this.records.delete(ip)
+    if (username) this.usernameRecords.delete(username)
+  }
+
+  /** 清理过期记录：未锁定且超过 TTL 的，或锁定已过期的，防止内存膨胀。 */
+  sweep() {
+    const now = Date.now()
+    for (const map of [this.records, this.usernameRecords]) {
+      for (const [key, rec] of map) {
+        if (rec.lockedUntil ? rec.lockedUntil <= now : now - rec.lastSeen > this.recordTtlMs) {
+          map.delete(key)
+        }
+      }
+    }
   }
 }

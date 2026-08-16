@@ -37,8 +37,9 @@ function stripHopByHop(headers) {
  * HTTP 反代：流式透传（SSE 等长连接天然支持）。
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
+ * @param {number} [proxyTimeoutMs] 上游无响应超时（毫秒），默认 60000
  */
-export function proxyRequest(req, res, targetHost, targetPort) {
+export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 60_000) {
   const headers = rewriteHeaders(req.headers, targetHost, targetPort)
   const upstream = http.request({
     host: targetHost,
@@ -51,10 +52,22 @@ export function proxyRequest(req, res, targetHost, targetPort) {
     res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
     upRes.pipe(res)
   })
-  upstream.on('error', (err) => {
+  let timedOut = false
+  upstream.setTimeout(proxyTimeoutMs, () => {
+    timedOut = true
+    upstream.destroy()
+    if (!res.headersSent) {
+      res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end('gateway timeout')
+    } else {
+      res.destroy()
+    }
+  })
+  upstream.on('error', () => {
+    if (timedOut) return
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end(`bad gateway: ${String(err.message ?? err)}`)
+      res.end('bad gateway')
     } else {
       res.destroy()
     }
@@ -64,12 +77,14 @@ export function proxyRequest(req, res, targetHost, targetPort) {
 
 /**
  * WebSocket 升级转发：把浏览器到门卫的 upgrade 请求原样转给 dsh，
- * 成功后双向 pipe 两个 socket。
+ * 成功后双向 pipe 两个 socket。握手阶段设置超时（默认不超过 15s）。
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:stream').Duplex} socket
  * @param {Buffer} head
+ * @param {number} [proxyTimeoutMs] 握手超时上限（毫秒），取与 15s 的较小值
  */
-export function proxyUpgrade(req, socket, head, targetHost, targetPort) {
+export function proxyUpgrade(req, socket, head, targetHost, targetPort, proxyTimeoutMs = 60_000) {
+  const handshakeTimeout = Math.min(proxyTimeoutMs, 15_000)
   const headers = rewriteHeaders(req.headers, targetHost, targetPort)
   headers.connection = 'Upgrade'
   headers.upgrade = 'websocket'
@@ -83,7 +98,13 @@ export function proxyUpgrade(req, socket, head, targetHost, targetPort) {
     agent: false,
   })
 
+  upstream.setTimeout(handshakeTimeout, () => {
+    upstream.destroy()
+    if (!socket.destroyed) socket.destroy()
+  })
+
   upstream.on('upgrade', (upRes, upSocket, upHead) => {
+    upstream.setTimeout(0)
     // 用后端的 rawHeaders 原样构造 101 响应（含 sec-websocket-accept）
     const raw = upRes.rawHeaders ?? []
     let response = 'HTTP/1.1 101 Switching Protocols\r\n'

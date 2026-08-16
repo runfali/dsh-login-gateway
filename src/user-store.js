@@ -35,8 +35,8 @@ export function loadUsersSync(path) {
  * 自动创建父目录（默认 ~/.dsh-login-gateway 可能不存在）。
  */
 export function saveUsersSync(path, users) {
-  mkdirSync(dirname(path), { recursive: true })
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
   const tmp = `${path}.${process.pid}.tmp`
-  writeFileSync(tmp, `${JSON.stringify({ users }, null, 2)}\n`, 'utf8')
+  writeFileSync(tmp, `${JSON.stringify({ users }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   renameSync(tmp, path)
 }

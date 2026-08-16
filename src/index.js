@@ -71,17 +71,31 @@ async function readJsonBody(req) {
   }
 }
 
+/**
+ * 门卫自己生成的响应统一加安全头：防 iframe 嵌入（点击劫持/钓鱼）、
+ * 防 Referer 泄漏、CSP 限制加载来源（内联样式/脚本必须 unsafe-inline）。
+ * 反代透传的 dsh 响应不加（保持透传原样）。
+ */
+function sendSecurityHeaders(res) {
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+}
+
 function sendJson(res, status, data) {
+  sendSecurityHeaders(res)
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
   res.end(JSON.stringify(data))
 }
 
 function sendHtml(res, status, html) {
+  sendSecurityHeaders(res)
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' })
   res.end(html)
 }
 
 function sendText(res, status, text) {
+  sendSecurityHeaders(res)
   res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' })
   res.end(text)
 }
@@ -95,7 +109,7 @@ function setupTokenPath(userStorePath) {
 function writeSetupToken(userStorePath, token, log) {
   const p = setupTokenPath(userStorePath)
   try {
-    mkdirSync(dirname(p), { recursive: true })
+    mkdirSync(dirname(p), { recursive: true, mode: 0o700 })
     writeFileSync(p, token, { encoding: 'utf8', mode: 0o600 })
     chmodSync(p, 0o600)
   } catch (err) {
@@ -122,6 +136,10 @@ export function apply(ctx, config = {}) {
     sessionTtlHours: config.sessionTtlHours ?? 24,
     maxLoginAttempts: config.maxLoginAttempts ?? 5,
     lockMinutes: config.lockMinutes ?? 5,
+    setupMaxAttempts: config.setupMaxAttempts ?? 5,
+    setupLockMinutes: config.setupLockMinutes ?? 30,
+    proxyTimeoutMs: config.proxyTimeoutMs ?? 60_000,
+    maxConnections: config.maxConnections ?? 512,
     userStorePath: config.userStorePath ?? path.join(os.homedir(), '.dsh-login-gateway', 'users.json'),
   }
   const seedUsers = config.users
@@ -130,6 +148,7 @@ export function apply(ctx, config = {}) {
   const log = getLog(ctx)
   const sessions = new SessionStore(cfg.sessionTtlHours * 3600_000)
   const limiter = new LoginLimiter(cfg.maxLoginAttempts, cfg.lockMinutes * 60_000)
+  const setupLimiter = new LoginLimiter(cfg.setupMaxAttempts, cfg.setupLockMinutes * 60_000)
   let users = null
   let initialized = false
   let setupToken = null
@@ -148,7 +167,7 @@ export function apply(ctx, config = {}) {
     removeSetupToken(cfg.userStorePath, log)
     log(`已从配置写入初始用户文件（${users.length} 个用户）`)
   } else {
-    setupToken = randomBytes(4).toString('hex').toUpperCase().replace(/^(.{4})/, '$1-')
+    setupToken = randomBytes(16).toString('hex').toUpperCase().replace(/(.{4})(?=.)/g, '$1-')
     // 三通道输出，确保令牌可见：console 直出 stdout + ctx.logger + 写入文件（0600）
     const tokenMsg = `登录门卫未初始化，请访问 http://<主机>:${cfg.listenPort}/setup 并输入一次性令牌：${setupToken}`
     console.log(`[login-gateway] ${tokenMsg}`)
@@ -159,38 +178,54 @@ export function apply(ctx, config = {}) {
   async function handleLogin(req, res) {
     const ip = req.socket.remoteAddress ?? 'unknown'
     if (limiter.isLocked(ip)) {
-      return sendJson(res, 401, { error: '失败次数过多，已临时锁定，请稍后再试' })
+      return sendJson(res, 401, { error: `失败次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
     }
+    const lockMsg = (dim) => dim === 'username' || dim === 'both'
+      ? '该账号已被临时锁定，请稍后再试'
+      : `失败次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试`
     const body = await readJsonBody(req)
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
     const username = String(body.username ?? '').trim()
     const password = String(body.password ?? '')
+    const preLock = limiter.lockedBy(ip, username)
+    if (preLock) return sendJson(res, 401, { error: lockMsg(preLock) })
     const user = users.find((u) => u.username === username)
     if (!user || !verifyPassword(password, user.passwordHash)) {
-      const remaining = limiter.recordFailure(ip)
-      if (limiter.isLocked(ip)) {
-        return sendJson(res, 401, { error: `失败次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
-      }
+      const remaining = limiter.recordFailure(ip, username)
+      const lock = limiter.lockedBy(ip, username)
+      if (lock) return sendJson(res, 401, { error: lockMsg(lock) })
       return sendJson(res, 401, { error: `用户名或密码错误，剩余可尝试次数：${remaining}` })
     }
-    limiter.reset(ip)
+    limiter.reset(ip, username)
     const token = sessions.create(user.username)
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${token}; Max-Age=${cfg.sessionTtlHours * 3600}; Path=/; HttpOnly; SameSite=Strict`)
     return sendJson(res, 200, { ok: true })
   }
 
   async function handleSetup(req, res) {
+    const ip = req.socket.remoteAddress ?? 'unknown'
+    if (setupLimiter.isLocked(ip)) {
+      return sendJson(res, 429, { error: `尝试次数过多，已锁定 ${cfg.setupLockMinutes} 分钟，请稍后再试` })
+    }
+    const fail = (msg) => {
+      const remaining = setupLimiter.recordFailure(ip)
+      if (setupLimiter.isLocked(ip)) {
+        return sendJson(res, 429, { error: `尝试次数过多，已锁定 ${cfg.setupLockMinutes} 分钟，请稍后再试` })
+      }
+      return sendJson(res, 400, { error: `${msg}，剩余可尝试次数：${remaining}` })
+    }
     const body = await readJsonBody(req)
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
     const token = String(body.token ?? '').trim()
     const username = String(body.username ?? '').trim()
     const password = String(body.password ?? '')
     const password2 = String(body.password2 ?? '')
-    if (token !== setupToken) return sendJson(res, 400, { error: '一次性令牌不正确' })
-    if (!username) return sendJson(res, 400, { error: '用户名不能为空' })
-    if (username.length > 64) return sendJson(res, 400, { error: '用户名长度不能超过 64 个字符' })
-    if (password.length < 8) return sendJson(res, 400, { error: '密码长度至少 8 位' })
-    if (password !== password2) return sendJson(res, 400, { error: '两次输入的密码不一致' })
+    if (token !== setupToken) return fail('一次性令牌不正确')
+    if (!username) return fail('用户名不能为空')
+    if (username.length > 64) return fail('用户名长度不能超过 64 个字符')
+    if (password.length < 8) return fail('密码长度至少 8 位')
+    if (password !== password2) return fail('两次输入的密码不一致')
+    setupLimiter.reset(ip)
     users = [{ username, passwordHash: hashPassword(password), createdAt: new Date().toISOString() }]
     saveUsersSync(cfg.userStorePath, users)
     removeSetupToken(cfg.userStorePath, log)
@@ -226,6 +261,7 @@ export function apply(ctx, config = {}) {
       if (req.method !== 'POST') return sendText(res, 405, '仅支持 POST')
       sessions.delete(cookies[COOKIE_NAME])
       res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`)
+      sendSecurityHeaders(res)
       res.writeHead(302, { Location: '/' })
       res.end()
       return
@@ -235,13 +271,14 @@ export function apply(ctx, config = {}) {
       if (pathname === '/') return sendHtml(res, 200, loginPageHtml)
       return sendJson(res, 401, { error: '未登录，请先访问 / 登录' })
     }
-    return proxyRequest(req, res, cfg.targetHost, cfg.targetPort)
+    return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs)
   }
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
       log(`请求处理出错：${err?.message ?? err}`)
       if (!res.headersSent) {
+        sendSecurityHeaders(res)
         res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
         res.end('内部错误')
       } else {
@@ -254,12 +291,20 @@ export function apply(ctx, config = {}) {
   server.on('upgrade', (req, socket, head) => {
     const session = sessions.get(parseCookies(req.headers.cookie)[COOKIE_NAME])
     if (!initialized || !session) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n')
+      socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src \'self\'; style-src \'unsafe-inline\'; script-src \'unsafe-inline\'\r\nConnection: close\r\n\r\n')
       socket.destroy()
       return
     }
-    proxyUpgrade(req, socket, head, cfg.targetHost, cfg.targetPort)
+    proxyUpgrade(req, socket, head, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs)
   })
+
+  // 并发上限 + 收紧超时防 slowloris（Node 默认 headersTimeout 60s 过长）：
+  // headersTimeout 15s 内未收全请求头断开；requestTimeout 30s 内未收全请求体断开；
+  // keepAliveTimeout 5s 空闲 keep-alive 连接回收，配合 maxConnections 防止连接堆积耗资源。
+  server.maxConnections = cfg.maxConnections
+  server.headersTimeout = 15_000
+  server.requestTimeout = 30_000
+  server.keepAliveTimeout = 5_000
 
   server.once('error', (err) => {
     log(`外部入口启动失败：${err?.message ?? err}`)
@@ -268,7 +313,11 @@ export function apply(ctx, config = {}) {
     log(`外部入口已启动：http://${cfg.listenHost}:${cfg.listenPort}（反代至 http://${cfg.targetHost}:${cfg.targetPort}）`)
   })
 
-  const sweepTimer = setInterval(() => sessions.sweep(), SWEEP_INTERVAL)
+  const sweepTimer = setInterval(() => {
+    sessions.sweep()
+    limiter.sweep()
+    setupLimiter.sweep()
+  }, SWEEP_INTERVAL)
   sweepTimer.unref?.()
 
   ctx?.effect?.(() => () => {

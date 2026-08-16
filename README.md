@@ -39,7 +39,7 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
    - **a) dsh 启动终端的输出**：插件会直接往进程 stdout 打印一行（不走日志服务，dsh 启动的终端里就能看到）：
 
      ```
-     [login-gateway] 登录门卫未初始化，请访问 http://<主机>:3081/setup 并输入一次性令牌：XXXX-XXXX
+     [login-gateway] 登录门卫未初始化，请访问 http://<主机>:3081/setup 并输入一次性令牌：ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ12-3456
      ```
 
    - **b) 读取令牌文件**：令牌同时写在用户文件同目录下的 `setup-token.txt`（权限 0600，内容仅令牌本身）：
@@ -67,6 +67,10 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
 | `sessionTtlHours` | `24` | 登录会话有效期（小时） |
 | `maxLoginAttempts` | `5` | 同一 IP 连续失败多少次后锁定 |
 | `lockMinutes` | `5` | 锁定持续分钟数 |
+| `setupMaxAttempts` | `5` | `/setup` 初始化：同一 IP 连续失败多少次后锁定 |
+| `setupLockMinutes` | `30` | `/setup` 初始化锁定持续分钟数 |
+| `proxyTimeoutMs` | `60000` | 反代上游（dsh）无响应超时（毫秒）；WS 握手超时取与 15s 的较小值 |
+| `maxConnections` | `512` | HTTP 服务最大并发连接数，超出后新连接被丢弃 |
 | `userStorePath` | `~/.dsh-login-gateway/users.json` | 用户数据文件路径（可自定义） |
 | `users` | 无（可选） | 种子用户数组 `[{ username, passwordHash }]`，仅当用户文件不存在时写入并采用 |
 
@@ -121,13 +125,19 @@ node bin/hash.js "你的密码"
 - **登出**：`POST /logout`（页面无入口时为 `curl -X POST http://<主机>:3081/logout`），会清除会话并跳回登录页。
 - **未登录访问**：`/` 返回登录页；其余路径返回 `401` JSON。
 - **限速**：同一 IP 连续输错 `maxLoginAttempts` 次会被锁定 `lockMinutes` 分钟，期间该 IP 登录一律 401 并提示锁定。
+- **账号锁定**：同一**用户名**跨 IP 累计失败 `maxLoginAttempts` 次也会被锁定——代理池分布式攻击（每 IP 只试几次）也会触发，锁定期间任何 IP 用该用户名登录都拒绝并提示"该账号已被临时锁定"；IP 与用户名两个维度独立计数、任一锁定即拒绝。
+- **初始化限速**：`/setup` 同样按 IP 限速——令牌错误、用户名空、密码过短、两次密码不一致均计失败，连续失败 `setupMaxAttempts` 次锁定 `setupLockMinutes` 分钟，期间一律返回 429。
 
 ## 安全说明
 
 - **务必走 HTTPS**：门卫本身只做 HTTP 登录 + 反代，公网直接暴露明文账号密码与流量有风险。建议在前面挂 Nginx/Caddy/云负载均衡做 TLS 终止（例如 443 → 127.0.0.1:3081）。
 - **会话 Cookie** 使用 `HttpOnly` + `SameSite=Strict`，页面无 XSS 注入点。
-- **一次性令牌**只在未初始化时有效，初始化后即失效；`setup-token.txt`（0600）只含令牌本身，初始化完成后自动删除。
-- **用户文件**默认在 `~/.dsh-login-gateway/users.json`，内含 scrypt 哈希（不可逆）。建议确保该文件权限仅当前用户可读写：`chmod 600 ~/.dsh-login-gateway/users.json`。
+- **一次性令牌**为 32 位随机十六进制（连字符分组展示，128 bit 熵），只在未初始化时有效，初始化后即失效；`setup-token.txt`（0600）只含令牌本身，初始化完成后自动删除。
+- **用户文件**默认在 `~/.dsh-login-gateway/users.json`，内含 scrypt 哈希（不可逆）。写入时自动使用 0600 权限、目录自动 0700，无需手工 `chmod`。
+- **登录/初始化限速**按来源 IP 与用户名双维度独立计算：初始化入口 `/setup` 在未初始化阶段暴露（默认 `0.0.0.0`），连续失败会被锁定并返回 429，防止分布式暴力猜测令牌抢占管理员账号；登录失败记录带 TTL（30 分钟未命中自动清理），防止内存膨胀。
+- **反代超时**：上游 dsh 无响应超 `proxyTimeoutMs`（默认 60s）返回 504，WS 握手超时不超过 15s；502/504 响应体为固定文案（`bad gateway`/`gateway timeout`），不泄漏内部错误信息。
+- **并发连接上限**：`maxConnections`（默认 512）限制最大并发连接数；`headersTimeout` 15s、`requestTimeout` 30s、`keepAliveTimeout` 5s 显式收紧（Node 默认 60s），防 slowloris 慢速攻击与连接堆积耗尽资源。
+- **安全响应头**：门卫自己生成的响应（登录页/引导页/JSON/302/401/410/429/405/500）统一带 `X-Frame-Options: DENY`（防 iframe 点击劫持/钓鱼）、`Referrer-Policy: no-referrer`、`Content-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'`（登录页/引导页为内联样式+内联脚本）。反代透传的 dsh 响应**不加**这些头，保持原样。
 - 登录/初始化接口有请求体大小上限（100KB），防止恶意超大请求。
 
 ## 重置与常见问题

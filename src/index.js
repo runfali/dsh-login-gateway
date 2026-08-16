@@ -28,6 +28,20 @@ const COOKIE_NAME = 'dsh_gw_session'
 const MAX_BODY = 100_000
 const SWEEP_INTERVAL = 30 * 60_000
 
+/**
+ * 浏览器自动请求的静态小资源（PWA manifest / favicon / robots.txt）：
+ * 浏览器这些请求默认不带 Cookie，未登录时门卫按 401 处理会在控制台持续报错。
+ * 未登录时对这些路径返回 204 空响应；已登录走正常反代。
+ */
+const AUTO_RESOURCE_PATHS = new Set([
+  '/manifest.webmanifest',
+  '/favicon.svg',
+  '/favicon.ico',
+  '/favicon.png',
+  '/apple-touch-icon.png',
+  '/robots.txt',
+])
+
 /** 取插件日志器；脱离 cordis 环境（直接运行/测试）时退回 console。 */
 function getLog(ctx) {
   const logger = ctx?.logger ? ctx.logger('login-gateway') : null
@@ -264,6 +278,14 @@ export function apply(ctx, config = {}) {
       res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`)
       sendSecurityHeaders(res)
       res.writeHead(302, { Location: '/' })
+      res.end()
+      return
+    }
+
+    // 浏览器自动请求资源：未登录返回 204（manifest/favicon 请求不带 Cookie，避免控制台 401 报错）；已登录走正常反代
+    if (!session && AUTO_RESOURCE_PATHS.has(pathname)) {
+      sendSecurityHeaders(res)
+      res.writeHead(204)
       res.end()
       return
     }

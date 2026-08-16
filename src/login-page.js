@@ -71,16 +71,31 @@ button:disabled { opacity: 0.5; cursor: default; transform: none; }
     </label>
     <button type="submit">登 录</button>
   </form>
-  <p id="error" class="error" role="alert"></p>
   <p class="foot">DeepSeek Harness · 一切皆插件</p>
 </main>
 <script>
 const form = document.getElementById('login-form')
-const error = document.getElementById('error')
 const btn = form.querySelector('button')
+
+// error 占位不写死在 HTML：出错时才动态创建 p#error.error[role=alert] 插入表单后
+function showError(msg) {
+  let el = document.getElementById('error')
+  if (!el) {
+    el = document.createElement('p')
+    el.id = 'error'
+    el.className = 'error'
+    el.setAttribute('role', 'alert')
+    form.after(el)
+  }
+  el.textContent = msg
+}
+function clearError() {
+  const el = document.getElementById('error')
+  if (el) el.textContent = ''
+}
 form.addEventListener('submit', async (e) => {
   e.preventDefault()
-  error.textContent = ''
+  clearError()
   btn.disabled = true
   try {
     const res = await fetch('/login', {
@@ -93,9 +108,9 @@ form.addEventListener('submit', async (e) => {
     })
     const data = await res.json().catch(() => ({}))
     if (res.ok && data.ok) window.location.href = '/'
-    else error.textContent = data.error || '登录失败，请稍后重试'
+    else showError(data.error || '登录失败，请稍后重试')
   } catch {
-    error.textContent = '网络错误，请稍后重试'
+    showError('网络错误，请稍后重试')
   } finally {
     btn.disabled = false
   }

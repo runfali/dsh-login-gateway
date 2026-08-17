@@ -32,7 +32,7 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
    npm install
    ```
 
-2. 在 dsh 的 profile 配置里挂载插件（编辑 `cordis.patch.yml`，见下节"部署步骤"），重启 dsh。
+2. 在 dsh 的 profile 配置里挂载插件（编辑 `cordis.patch.yml`，见下节"安装与卸载"），重启 dsh。
 
 3. **获取一次性初始化令牌**（二选一）：
 
@@ -52,11 +52,11 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
 
 5. 跳转到登录页，用刚创建的账号登录，即可进入 dsh。
 
-> 说明：令牌只在**未初始化**时生成；初始化完成后 `/setup` 会返回 410，`setup-token.txt` 也会被自动删除。
+> 说明：**新装没有默认账号**，必须走 `/setup` 引导创建；未初始化时访问 `/` 会自动 302 跳转到 `/setup`。令牌只在**未初始化**时生成；初始化完成后 `/setup` 会返回 410，`setup-token.txt` 也会被自动删除。
 
 ## 配置项
 
-所有配置都有缺省值，只有 `users`（可选）需要在确实要"从配置写死初始账号"时才填写。完整配置表：
+所有配置都有缺省值，新装默认配置即可工作（不配置任何账号，首次使用走 `/setup` 引导创建）。完整配置表：
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -73,30 +73,10 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
 | `streamIdleTimeoutMs` | `1800000` | 反代响应流空闲超时（毫秒，默认 30 分钟）：响应头到达后 SSE 等长思考间隙不被 60s 请求超时打断，仅长时间无数据才断开 |
 | `maxConnections` | `512` | HTTP 服务最大并发连接数，超出后新连接被丢弃 |
 | `userStorePath` | `~/.dsh-login-gateway/users.json` | 用户数据文件路径（可自定义） |
-| `users` | 无（可选） | 种子用户数组 `[{ username, passwordHash }]`，仅当用户文件不存在时写入并采用 |
 
-### `users` 种子配置（可选，向后兼容）
+## 安装与卸载（cordis.patch.yml）
 
-首次安装不想走 `/setup` 引导的话，可以直接在配置里写死初始账号：
-
-```yaml
-config:
-  users:
-    - username: admin
-      passwordHash: 'scrypt$16384$8$1$...'   # 用下面的工具生成
-```
-
-生成哈希：
-
-```bash
-npx dsh-login-gateway-hash "你的密码"
-# 或直接运行
-node bin/hash.js "你的密码"
-```
-
-> 种子只在**用户文件不存在**时写入文件并采用。一旦 `/setup` 创建过账号或文件已存在，改 `users` 配置不再生效——请直接编辑 `users.json` 文件。
-
-## 部署步骤（cordis.patch.yml）
+### 安装
 
 在 dsh 的 profile 目录（如 `/root/.dsh/profiles/web/`）的 `cordis.patch.yml` 中追加挂载项：
 
@@ -112,13 +92,25 @@ node bin/hash.js "你的密码"
         sessionTtlHours: 24
         maxLoginAttempts: 5
         lockMinutes: 5
-        # 首次安装可不配 users，改用 /setup 引导创建管理员账号
-        # users:
-        #   - username: admin
-        #     passwordHash: 'scrypt$16384$8$1$...'
 ```
 
-保存后重启 dsh，或使用 dsh 的热重载功能。
+保存后重启 dsh（或使用 dsh 的热重载功能）。新装**无需配置任何账号**：重启后进入"未初始化"状态，按上文"快速开始"拿一次性令牌、打开 `/setup` 创建管理员账号即可。
+
+### 卸载
+
+1. 从 `cordis.patch.yml` **删除**上面的挂载 entry；
+2. 重启 dsh；
+3. 门卫端口 3081 停止服务，外部访问恢复为"无法访问"（dsh 本身不受任何影响，恢复原样）。
+
+可选清理：删除门卫的用户数据目录（账号、令牌文件）：
+
+```bash
+rm -rf ~/.dsh-login-gateway/
+```
+
+### 是否影响 dsh 本身？
+
+**零侵入**。门卫只做三件事：在外部开一个登录入口、校验会话、把通过校验的请求反代到 dsh 的 loopback 端口。它**不修改 dsh 安装目录的任何文件**，**不修改 dsh 的配置**（唯一的改动就是 `cordis.patch.yml` 里挂载它的那一段，卸载时删掉即可），dsh 本身继续只监听 `127.0.0.1:3080`。卸载后 dsh 与安装前完全一致。
 
 ## 使用说明
 

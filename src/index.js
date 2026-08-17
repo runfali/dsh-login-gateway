@@ -57,18 +57,6 @@ function parseCookies(header) {
   return out
 }
 
-/** 校验可选种子配置 users：提供时须为非空数组且每项含 username + passwordHash。 */
-function validateSeedUsers(users) {
-  if (!Array.isArray(users) || users.length === 0) {
-    throw new Error('users 配置项必须是非空数组')
-  }
-  for (const u of users) {
-    if (!u || typeof u.username !== 'string' || !u.username || typeof u.passwordHash !== 'string' || !u.passwordHash) {
-      throw new Error('users 配置项每项须包含非空 username 与 passwordHash')
-    }
-  }
-}
-
 /** 读取并解析请求体 JSON；非 JSON 或超大返回 null。 */
 async function readJsonBody(req) {
   const chunks = []
@@ -157,9 +145,8 @@ export function apply(ctx, config = {}) {
     maxConnections: config.maxConnections ?? 512,
     userStorePath: config.userStorePath ?? path.join(os.homedir(), '.dsh-login-gateway', 'users.json'),
   }
-  const seedUsers = config.users
-  if (seedUsers !== undefined) validateSeedUsers(seedUsers)
-
+  // config.users 种子机制已废弃（会造成"默认用户"）：配置里仍有 users 字段时忽略，不报错。
+  // 新装一律强制走 /setup 引导创建账号；本地无用户数据 = 未初始化。
   const log = getLog(ctx)
   const sessions = new SessionStore(cfg.sessionTtlHours * 3600_000)
   const limiter = new LoginLimiter(cfg.maxLoginAttempts, cfg.lockMinutes * 60_000)
@@ -168,19 +155,13 @@ export function apply(ctx, config = {}) {
   let initialized = false
   let setupToken = null
 
-  // 用户加载优先级：用户文件 > config.users 种子 > 未初始化
+  // 用户加载：文件存在 → 已初始化；不存在 → 未初始化
   const fileUsers = loadUsersSync(cfg.userStorePath)
   if (fileUsers !== null) {
     users = fileUsers
     initialized = true
     removeSetupToken(cfg.userStorePath, log)
     log(`已从用户文件加载 ${users.length} 个用户`)
-  } else if (seedUsers) {
-    users = seedUsers
-    saveUsersSync(cfg.userStorePath, users)
-    initialized = true
-    removeSetupToken(cfg.userStorePath, log)
-    log(`已从配置写入初始用户文件（${users.length} 个用户）`)
   } else {
     setupToken = randomBytes(16).toString('hex').toUpperCase().replace(/(.{4})(?=.)/g, '$1-')
     // 三通道输出，确保令牌可见：console 直出 stdout + ctx.logger + 写入文件（0600）
@@ -256,14 +237,19 @@ export function apply(ctx, config = {}) {
     const cookies = parseCookies(req.headers.cookie)
     const session = sessions.get(cookies[COOKIE_NAME])
 
-    // 未初始化：只开放 /setup，其余路径引导到初始化
+    // 未初始化：/ 302 跳转 /setup 引导注册，其余路径引导到初始化
     if (!initialized) {
       if (pathname === '/setup') {
         if (req.method === 'GET') return sendHtml(res, 200, setupPageHtml)
         if (req.method === 'POST') return handleSetup(req, res)
         return sendText(res, 405, '仅支持 GET / POST')
       }
-      if (pathname === '/') return sendHtml(res, 200, setupPageHtml)
+      if (pathname === '/') {
+        sendSecurityHeaders(res)
+        res.writeHead(302, { Location: '/setup' })
+        res.end()
+        return
+      }
       return sendJson(res, 401, { error: '登录门卫尚未初始化，请先访问 /setup 完成设置' })
     }
 

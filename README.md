@@ -31,16 +31,19 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
 
 ## 快速开始（首次安装）
 
-1. 把本项目放到 dsh 服务器上（例如 `/data/dsh-login-gateway`），并安装依赖（仅 devDependencies，运行时无依赖）：
+1. 用 dsh 标准插件命令安装（本项目是标准 `dsh.bundle` 插件，无需手改 profile 配置）：
 
    ```bash
-   cd /data/dsh-login-gateway
-   npm install
+   # 本地目录安装（link 形式，profile 直接引用本目录，改源码无需重装）
+   dsh plugin --profile web add /path/to/dsh-login-gateway
+
+   # 卸载
+   dsh plugin --profile web remove dsh-login-gateway
    ```
 
-2. 在 dsh 的 profile 配置里挂载插件（编辑 `cordis.patch.yml`，见下文“安装与卸载”），然后重启 dsh。
+   安装/卸载后**重启 dsh** 生效。
 
-3. 获取一次性初始化令牌（二选一）：
+2. 获取一次性初始化令牌（二选一）：
 
    - **方式 A：看 dsh 启动终端或服务日志输出**
 
@@ -62,39 +65,33 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
      cat ~/.dsh-login-gateway/setup-token.txt
      ```
 
-4. 浏览器打开 `http://<主机>:3081/setup`，输入令牌、管理员用户名、密码（至少 8 位）与确认密码，点击“完成设置”。
+3. 浏览器打开 `http://<主机>:3081/setup`，输入令牌、管理员用户名、密码（至少 8 位）与确认密码，点击“完成设置”。
 
-5. 初始化完成后会跳转到登录页，用刚创建的账号登录，即可进入 dsh。
+4. 初始化完成后会跳转到登录页，用刚创建的账号登录，即可进入 dsh。
 
 > 说明：新装**没有默认账号**，必须走 `/setup` 引导创建。未初始化时访问 `/` 会自动 `302` 跳转到 `/setup`。令牌只在**未初始化**阶段生成；初始化完成后 `/setup` 会返回 `410`，`setup-token.txt` 也会被自动删除。
 
-## 安装与卸载（cordis.patch.yml）
+## 安装与卸载（标准 bundle 插件）
+
+本项目是标准的 `dsh.bundle` 插件（`package.json` 声明 `dsh.bundle.patch`，随包自带 `cordis.patch.yml` 挂载层），用 dsh 官方插件命令管理，**无需手改 profile 配置**：
 
 ### 安装
 
-在 dsh 的 profile 目录（如 `/root/.dsh/profiles/web/`）的 `cordis.patch.yml` 中追加挂载项：
-
-```yaml
-- insert:
-    - id: login-gateway
-      name: '/data/dsh-login-gateway/src/index.js'
-      config:
-        listenHost: '0.0.0.0'
-        listenPort: 3081
-        targetHost: '127.0.0.1'
-        targetPort: 3080
-        sessionTtlHours: 24
-        maxLoginAttempts: 5
-        lockMinutes: 5
+```bash
+dsh plugin --profile web add /path/to/dsh-login-gateway
 ```
 
-保存后重启 dsh（或使用 dsh 的热重载功能）。新装**无需预先配置任何账号**：重启后进入“未初始化”状态，按上文“快速开始”拿一次性令牌，打开 `/setup` 创建管理员账号即可。
+命令会把本目录以 `link:` 形式装进 profile（`~/.dsh/profiles/web/`），并自动把包名追加到 profile 的 `dsh.profile.bundles` 层列表。安装后**重启 dsh** 生效。
+
+> 开发调试提示：`link:` 形式下 profile 直接引用本目录，改源码后重启 dsh 即可生效，无需重装。
 
 ### 卸载
 
-1. 从 `cordis.patch.yml` 删除上面的挂载项；
-2. 重启 dsh；
-3. 门卫端口 `3081` 停止服务，外部访问恢复为“无法访问”。
+```bash
+dsh plugin --profile web remove dsh-login-gateway
+```
+
+重启 dsh 后，门卫端口 `3081` 停止服务，外部访问恢复为“无法访问”。
 
 可选清理：删除门卫的用户数据目录（账号、令牌文件）：
 
@@ -102,9 +99,25 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
 rm -rf ~/.dsh-login-gateway/
 ```
 
+### 个性化配置
+
+随包挂载层只提供默认配置。如需改端口、超时等，在 profile 目录（如 `~/.dsh/profiles/web/`）的 `cordis.patch.yml` 用户层追加覆盖（注意：补丁是**整段替换** `config`，要写全所有项）：
+
+```yaml
+- id: login-gateway
+  config:
+    listenHost: '0.0.0.0'
+    listenPort: 3081
+    targetHost: '127.0.0.1'
+    targetPort: 3080
+    sessionTtlHours: 24
+    maxLoginAttempts: 5
+    lockMinutes: 5
+```
+
 ### 是否影响 dsh 本身
 
-**零侵入**。门卫只做三件事：在外部开一个登录入口、校验会话、把通过校验的请求反代到 dsh 的 loopback 端口。它**不修改 dsh 安装目录的任何文件**，也**不改 dsh 自身配置逻辑**；唯一改动就是 `cordis.patch.yml` 里挂载它的那一段，卸载时删掉即可。卸载后 dsh 与安装前一致。
+**零侵入**。门卫只做三件事：在外部开一个登录入口、校验会话、把通过校验的请求反代到 dsh 的 loopback 端口。它**不修改 dsh 安装目录的任何文件**，也**不改 dsh 自身配置逻辑**；安装/卸载只影响 profile 目录（依赖与 bundles 列表），一条命令即可完全移除。卸载后 dsh 与安装前一致。
 
 ## 配置项
 

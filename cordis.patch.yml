@@ -1,10 +1,19 @@
-# dsh-login-gateway 挂载补丁示例
-# 用法：把下面的 insert 段合并进 dsh profile 目录（如 ~/.dsh/profiles/web/）的 cordis.patch.yml，
-# 其中 name 改为你本机插件目录的实际路径，然后重启 dsh。
-# 详见 README「安装与卸载」一节。
+# dsh-login-gateway bundle patch：随包自带的挂载层。
+# 安装方式（标准 bundle 插件，无需手改 profile 配置）：
+#   dsh plugin --profile web add /path/to/dsh-login-gateway
+# 卸载：
+#   dsh plugin --profile web remove dsh-login-gateway
+# 安装/卸载后重启 dsh 生效。
+#
+# 本层只提供默认配置；个性化覆盖（改端口、超时等）请写在 profile 目录
+# （如 ~/.dsh/profiles/web/）的 cordis.patch.yml 用户层里，用
+# `- id: login-gateway` 覆盖（注意：补丁是整段替换 config，覆盖时要写全所有项）。
+#
+# 新装没有默认账号：首次启动进入"未初始化"状态，按 README「快速开始」
+# 拿一次性令牌，访问 /setup 创建管理员账号。
 - insert:
     - id: login-gateway
-      name: '/path/to/dsh-login-gateway/src/index.js'
+      name: 'dsh-login-gateway'
       config:
         listenHost: '0.0.0.0'
         listenPort: 3081

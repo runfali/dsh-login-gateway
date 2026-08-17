@@ -9,9 +9,9 @@
   },
   "license": "MIT",
   "dsh": {
-    "plugin": true,
-    "entry": "src/index.js",
-    "mount": "cordis.patch.yml"
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "keywords": [
     "dsh",

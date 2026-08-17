@@ -8,6 +8,11 @@
     "dsh-login-gateway-hash": "bin/hash.js"
   },
   "license": "MIT",
+  "dsh": {
+    "plugin": true,
+    "entry": "src/index.js",
+    "mount": "cordis.patch.yml"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",

@@ -1,0 +1,15 @@
+# dsh-login-gateway 挂载补丁示例
+# 用法：把下面的 insert 段合并进 dsh profile 目录（如 ~/.dsh/profiles/web/）的 cordis.patch.yml，
+# 其中 name 改为你本机插件目录的实际路径，然后重启 dsh。
+# 详见 README「安装与卸载」一节。
+- insert:
+    - id: login-gateway
+      name: '/path/to/dsh-login-gateway/src/index.js'
+      config:
+        listenHost: '0.0.0.0'
+        listenPort: 3081
+        targetHost: '127.0.0.1'
+        targetPort: 3080
+        sessionTtlHours: 24
+        maxLoginAttempts: 5
+        lockMinutes: 5

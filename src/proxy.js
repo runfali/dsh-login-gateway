@@ -65,13 +65,114 @@ const LOGOUT_BUTTON_TAG = `<script>
 })();
 </script>`
 
+/**
+ * 客户端 loopback 信任补丁：经门卫反代访问时，浏览器地址栏的 hostname 不是
+ * loopback（外部域名/IP），dsh 客户端据此把 connection.isLoopback 判为 false，
+ * 导致设置作用域进入 'memory' 模式——设置读取/写入全部被丢弃，表现为改了设置
+ * （深色模式、插话发送等）一刷新就还原。
+ *
+ * 门卫已在服务端把 Host/Origin 改写为 127.0.0.1 形态，服务端信任围栏照常放行，
+ * 设置写入会正常落到 ~/.dsh/settings.yaml；本补丁只把浏览器端的连接标记同步为
+ * loopback，让 dsh 客户端启用完整的设置持久化（内存态，不触碰 location/origin，
+ * 所有请求仍走门卫自身地址；服务端围栏不受影响）。
+ *
+ * 实现：引导脚本先于应用 bundle 执行，用访问器拦截 window.__ModuleLoader__ 的
+ * 安装，把 '@deepseek-ai/dsh-client-connection' 模块的 apply 包一层——应用时把
+ * 已提供的 connection handle 的 isLoopback 置为 true。补丁失败只退回"设置不持久化"
+ * 的旧行为，不影响应用启动。
+ */
+const LOOPBACK_PATCH_TAG = `<script>
+(function () {
+  var FLAG = '__DSH_GW_LOOPBACK_PATCH__'
+  if (window[FLAG]) return
+  window[FLAG] = true
+
+  var loader = window.__ModuleLoader__
+  if (loader && typeof loader.load === 'function') { patchLoader(loader); return }
+
+  var installed
+  Object.defineProperty(window, '__ModuleLoader__', {
+    configurable: true,
+    get: function () { return installed },
+    set: function (value) {
+      installed = value
+      if (value) patchLoader(value)
+    }
+  })
+
+  function patchLoader(loader) {
+    var origLoad = loader.load
+    if (typeof origLoad !== 'function' || origLoad.__gwLoopback__) return
+    origLoad.__gwLoopback__ = true
+    loader.load = function (handoff) {
+      if (handoff && handoff.id === '@deepseek-ai/dsh-client-connection' && typeof handoff.factory === 'function') {
+        var origFactory = handoff.factory
+        handoff.factory = function (require) {
+          var mod = origFactory.call(this, require)
+          var entry = (mod && mod.exports) ? mod.exports : mod
+          if (entry && typeof entry.apply === 'function' && !entry.apply.__gwLoopback__) {
+            var origApply = entry.apply
+            entry.apply = function (ctx) {
+              var result = origApply.apply(this, arguments)
+              try {
+                var conn = ctx && typeof ctx.get === 'function' ? ctx.get('connection', false) : null
+                if (conn && typeof conn === 'object' && !conn.isLoopback) conn.isLoopback = true
+              } catch (err) { /* 静默：设置退回不持久化，不影响启动 */ }
+              return result
+            }
+          }
+          return mod
+        }
+      }
+      return origLoad.call(this, handoff)
+    }
+  }
+})();
+</script>`
+
+/**
+ * 设置文件下载兜底脚本：dsh「打开配置文件」依赖宿主机系统级打开
+ * （Linux 走 xdg-open / macOS open / Windows Invoke-Item）。无桌面环境
+ * （容器、无显示器服务器）上该操作必然失败，前端只显示"无法打开配置文件"。
+ * 当门卫探测到宿主无法原生打开时注入本脚本：把该按钮的点击改指到门卫自己的
+ * 下载路由（GET /__gateway/settings.yaml，需登录），让远端用户直接取回文件。
+ * 仅替换按钮行为，不触碰 dsh 其余界面；桌面环境主机不注入，原生打开不受影响。
+ */
+const SETTINGS_DOWNLOAD_TAG = `<script>
+(function () {
+  var LABELS = ['打开配置文件', 'Open configuration file']
+  function isSettingsOpenButton(node) {
+    while (node && node !== document) {
+      if (node.tagName === 'BUTTON') {
+        var text = (node.textContent || '').replace(/\s+/g, ' ').trim()
+        if (LABELS.indexOf(text) !== -1) return true
+      }
+      node = node.parentNode
+    }
+    return false
+  }
+  document.addEventListener('click', function (e) {
+    if (!isSettingsOpenButton(e.target)) return
+    e.preventDefault()
+    e.stopPropagation()
+    window.location.href = '/__gateway/settings.yaml'
+  }, true)
+})();
+</script>`
 const INJECT_TAGS = POLYFILL_TAG + LOGOUT_BUTTON_TAG
 
-/** 在 </head> 前注入脚本（无 </head> 则 </body> 前，都没有则追加末尾）。 */
-function injectTags(html) {
-  if (html.includes('</head>')) return html.replace('</head>', `${INJECT_TAGS}</head>`)
-  if (html.includes('</body>')) return html.replace('</body>', `${INJECT_TAGS}</body>`)
-  return html + INJECT_TAGS
+/**
+ * 注入脚本：时机敏感的补丁（loopback 信任）插到 <head> 最前，保证先于任何
+ * 应用脚本执行；常规注入（polyfill/退出按钮）仍在 </head> 前；
+ * 无 </head> 则 </body> 前，都没有则追加末尾。
+ */
+function injectTags(html, extraTags = '') {
+  if (html.includes('<head>')) {
+    return html.replace('<head>', `<head>${extraTags}`).replace('</head>', `${INJECT_TAGS}</head>`)
+  }
+  if (html.includes('</head>')) return html.replace('</head>', `${INJECT_TAGS + extraTags}</head>`)
+  if (html.includes('</body>')) return html.replace('</body>', `${INJECT_TAGS + extraTags}</body>`)
+  return html + INJECT_TAGS + extraTags
 }
 
 /**
@@ -83,8 +184,12 @@ function injectTags(html) {
  * @param {import('node:http').ServerResponse} res
  * @param {number} [proxyTimeoutMs] 上游响应头等待超时（毫秒），默认 60000
  * @param {number} [streamIdleTimeoutMs] 响应流空闲超时（毫秒），默认 30 分钟
+ * @param {{ clientLoopbackTrust?: boolean, settingsDownload?: boolean }} [injectOpts] HTML 注入开关：
+ *   clientLoopbackTrust 注入客户端 loopback 信任补丁（恢复设置持久化），默认 true；
+ *   settingsDownload 无桌面环境时注入设置文件下载兜底，默认 false
  */
-export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 60_000, streamIdleTimeoutMs = 30 * 60_000) {
+export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 60_000, streamIdleTimeoutMs = 30 * 60_000, injectOpts = {}) {
+  const { clientLoopbackTrust = true, settingsDownload = false } = injectOpts
   const headers = rewriteHeaders(req.headers, targetHost, targetPort)
   const upstream = http.request({
     host: targetHost,
@@ -121,7 +226,8 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
         }
       })
       upRes.on('end', () => {
-        const injected = injectTags(Buffer.concat(chunks).toString('utf8'))
+        const extraTags = (clientLoopbackTrust ? LOOPBACK_PATCH_TAG : '') + (settingsDownload ? SETTINGS_DOWNLOAD_TAG : '')
+        const injected = injectTags(Buffer.concat(chunks).toString('utf8'), extraTags)
         const outHeaders = stripHopByHop(upRes.headers)
         delete outHeaders['content-length']
         res.writeHead(upRes.statusCode ?? 502, outHeaders)
@@ -216,4 +322,16 @@ export function proxyUpgrade(req, socket, head, targetHost, targetPort, proxyTim
   })
 
   upstream.end()
+}
+
+/**
+ * 宿主是否能『原生打开』文件（dsh 的打开配置文件依赖它）。
+ * 与 dsh 的 canOpenNativePath 判定一致：macOS/Windows 恒真；
+ * Linux 仅在 WSL 或存在 DISPLAY/WAYLAND_DISPLAY 时为真；
+ * 容器/无显示器服务器为假（原生打开必然失败）。
+ */
+export function nativeOpenAvailable() {
+  if (process.platform === 'darwin' || process.platform === 'win32') return true
+  if (process.platform !== 'linux') return false
+  return Boolean(process.env.WSL_DISTRO_NAME) || Boolean(process.env.DISPLAY) || Boolean(process.env.WAYLAND_DISPLAY)
 }

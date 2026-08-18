@@ -17,7 +17,8 @@ import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'nod
 import { dirname } from 'node:path'
 
 import { hashPassword, LoginLimiter, SessionStore, verifyPassword } from './auth.js'
-import { proxyRequest, proxyUpgrade } from './proxy.js'
+import { nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
+import { defaultSettingsFilePath, settingsFilePayload } from './settings-file.js'
 import { loadUsersSync, saveUsersSync } from './user-store.js'
 import { loginPageHtml } from './login-page.js'
 import { setupPageHtml } from './setup-page.js'
@@ -144,6 +145,9 @@ export function apply(ctx, config = {}) {
     streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 1800_000,
     maxConnections: config.maxConnections ?? 512,
     userStorePath: config.userStorePath ?? path.join(os.homedir(), '.dsh-login-gateway', 'users.json'),
+    clientLoopbackTrust: config.clientLoopbackTrust ?? true,
+    settingsFilePath: config.settingsFilePath ?? defaultSettingsFilePath(),
+    settingsFileDownload: config.settingsFileDownload ?? true,
   }
   // config.users 种子机制已废弃（会造成"默认用户"）：配置里仍有 users 字段时忽略，不报错。
   // 新装一律强制走 /setup 引导创建账号；本地无用户数据 = 未初始化。
@@ -271,14 +275,33 @@ export function apply(ctx, config = {}) {
     // 浏览器自动请求的纯静态元数据（manifest/favicon/robots.txt，无敏感信息）：
     // 未登录也直接放行反代——否则标签页无图标、PWA 不可安装（请求不带 Cookie 属正常）
     if (!session && AUTO_RESOURCE_PATHS.has(pathname)) {
-      return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs)
+      return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs, {
+        clientLoopbackTrust: cfg.clientLoopbackTrust,
+        settingsDownload: cfg.settingsFileDownload && !nativeOpenAvailable(),
+      })
     }
 
     if (!session) {
       if (pathname === '/') return sendHtml(res, 200, loginPageHtml)
       return sendJson(res, 401, { error: '未登录，请先访问 / 登录' })
     }
-    return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs)
+
+    // 门卫托管的设置文件下载（需登录）：宿主机无桌面环境时 dsh 原生打开必然失败，
+    // 改为由门卫直接下发文件（见 SETTINGS_DOWNLOAD_TAG 注入脚本）。
+    if (cfg.settingsFileDownload && pathname === '/__gateway/settings.yaml') {
+      if (req.method !== 'GET') return sendText(res, 405, '仅支持 GET')
+      const payload = settingsFilePayload(cfg.settingsFilePath)
+      if (!payload.ok) return sendJson(res, payload.status, { error: payload.reason })
+      sendSecurityHeaders(res)
+      res.writeHead(payload.status, payload.headers)
+      res.end(payload.body)
+      return
+    }
+
+    return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs, {
+      clientLoopbackTrust: cfg.clientLoopbackTrust,
+      settingsDownload: cfg.settingsFileDownload && !nativeOpenAvailable(),
+    })
   }
 
   const server = http.createServer((req, res) => {

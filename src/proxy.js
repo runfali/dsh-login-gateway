@@ -3,6 +3,10 @@
  * 关键：把外部请求伪装成"本机 loopback 请求"——改写 Host/Origin/Sec-Fetch-Site
  * 三个头，让 dsh 的 /api 信任围栏（trust fence）放行，且特权方法
  * （settings/credentials 等仅限 loopback）也全部可用，功能零缺失。
+ * 对缺失浏览器 Fetch Metadata 的请求（curl、隐私浏览器等）补上
+ * Sec-Fetch-Site: same-origin，保证依赖同源校验的上游插件路由
+ * （如 @anionex/dsh-vision-toolkit 的 paste-policy）也能通过；
+ * 已在门卫登录闸门之后，无跨站风险。
  */
 
 import http from 'node:http'
@@ -13,14 +17,14 @@ const HOP_BY_HOP = new Set([
   'te', 'trailer', 'transfer-encoding', 'upgrade',
 ])
 
-/** 改写请求头：Host/Origin/Sec-Fetch-Site 换成 loopback 形态。 */
+/** 改写请求头：Host/Origin/Sec-Fetch-Site 换成 loopback 形态；Sec-Fetch-Site 缺失时补齐 same-origin。 */
 export function rewriteHeaders(headers, targetHost, targetPort) {
   const authority = `${targetHost}:${targetPort}`
   const out = { ...headers }
   delete out['proxy-connection']
   if (out.host !== undefined) out.host = authority
   if (out.origin !== undefined) out.origin = `http://${authority}`
-  if (out['sec-fetch-site'] !== undefined) out['sec-fetch-site'] = 'same-origin'
+  out['sec-fetch-site'] = 'same-origin'
   return out
 }
 

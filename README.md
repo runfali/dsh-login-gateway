@@ -178,6 +178,7 @@ rm -rf ~/.dsh-login-gateway/
 - **`/setup` 返回 `410`**：说明已初始化完成，设置入口已关闭，属正常现象。如需重新初始化，先删用户文件再重启。
 - **访问 `http://<主机>:3081/` 打不开**：检查 dsh 是否已启动、插件挂载是否生效、端口是否被防火墙拦截。
 - **登录后页面或接口 `502`**：门卫反代目标 `127.0.0.1:3080` 不可达，确认 dsh Web UI 进程仍在运行。
+- **对话/粘贴时 `/_dsh/vision-toolkit/paste-policy` 等 `/_dsh/` 路由返回 `403`（`origin-rejected`）**：这是上游插件（如 `@anionex/dsh-vision-toolkit`）对请求做的同源校验——没有 `Origin` 时要求 `Sec-Fetch-Site` 为 `same-origin` 等；curl、隐私浏览器等不带浏览器 Fetch Metadata 的客户端会被拒绝。门卫已在反代时把缺失的 `Sec-Fetch-Site` 补齐为 `same-origin`（本修复需重启 dsh 生效），正常浏览器不受影响。
 - **用户文件损坏**：启动会直接报错并给出文件路径，不会静默重置。按上面的“重置管理员账号”处理即可。
 - **改了设置（深色模式、插话发送等）一刷新就还原**：这是 dsh 的机制限制，不是登录态问题。dsh 把“设置持久化”门控在浏览器地址栏为 loopback（`127.0.0.1`/`localhost`）上；经门卫从外部域名/IP 访问时该判定为否，设置作用域进入内存模式——改动只在当次页面生效，刷新即丢。门卫已在服务端把请求伪装为 loopback 让 dsh 信任围栏放行，并默认注入客户端补丁（`clientLoopbackTrust: true`）把浏览器端连接标记同步为 loopback，从而恢复持久化（设置会正常写入 `~/.dsh/settings.yaml`）。若设置 `clientLoopbackTrust: false` 关闭补丁，将退回“设置不持久化”的旧行为。**注意：本修复不修改 dsh 任何源码，改的是门卫反向代理注入的浏览器端脚本；改动需重启 dsh 生效。**
 - **设置-打开配置文件提示「无法打开配置文件」**：dsh 的该按钮会在服务器上调用系统级打开（Linux 走 `xdg-open`），无桌面环境（容器、无显示器服务器）上必然失败——这是宿主限制，不是登录态或门卫问题。门卫已默认提供兜底：探测到宿主无桌面环境时，自动把该按钮改为从门卫下载 `~/.dsh/settings.yaml`（`/__gateway/settings.yaml`，需登录）；桌面环境主机保持 dsh 原生打开。可在配置里关闭（`settingsFileDownload: false`）。

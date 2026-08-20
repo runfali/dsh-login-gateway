@@ -141,7 +141,7 @@ rm -rf ~/.dsh-login-gateway/
 | `streamIdleTimeoutMs` | `1800000` | 反代响应流空闲超时（毫秒，默认 30 分钟） |
 | `maxConnections` | `512` | HTTP 服务最大并发连接数，超出后新连接被丢弃 |
 | `userStorePath` | `~/.dsh-login-gateway/users.json` | 用户数据文件路径（可自定义） |
-| `clientLoopbackTrust` | `true` | 经门卫访问时，在浏览器端把 dsh 连接标记为 loopback，恢复设置持久化（深色模式、插话发送等）。设 `false` 可关闭（设置将退回不持久化） |
+| `clientLoopbackTrust` | `true` | 经门卫访问时，通过随包自带的浏览器端 client bundle（`lib/client.js`）把 dsh 连接标记为 loopback，恢复设置持久化（深色模式、插话发送等），同时保证「设置-模型」「设置-插件-插件配置」正常显示。设 `false` 可关闭（设置将退回不持久化） |
 | `settingsFilePath` | `~/.dsh/settings.yaml` | dsh 设置文件路径（供下载路由使用，一般无需改动） |
 | `settingsFileDownload` | `true` | 宿主机无桌面环境（容器/无显示器服务器）时，把 dsh 设置页的「打开配置文件」按钮改为从门卫下载该文件（`/__gateway/settings.yaml`）；桌面环境主机自动保持 dsh 原生打开。设 `false` 关闭该兜底 |
 
@@ -180,7 +180,7 @@ rm -rf ~/.dsh-login-gateway/
 - **登录后页面或接口 `502`**：门卫反代目标 `127.0.0.1:3080` 不可达，确认 dsh Web UI 进程仍在运行。
 - **对话/粘贴时 `/_dsh/vision-toolkit/paste-policy` 等 `/_dsh/` 路由返回 `403`（`origin-rejected`）**：这是上游插件（如 `@anionex/dsh-vision-toolkit`）对请求做的同源校验——没有 `Origin` 时要求 `Sec-Fetch-Site` 为 `same-origin` 等；curl、隐私浏览器等不带浏览器 Fetch Metadata 的客户端会被拒绝。门卫已在反代时把缺失的 `Sec-Fetch-Site` 补齐为 `same-origin`（本修复需重启 dsh 生效），正常浏览器不受影响。
 - **用户文件损坏**：启动会直接报错并给出文件路径，不会静默重置。按上面的“重置管理员账号”处理即可。
-- **改了设置（深色模式、插话发送等）一刷新就还原**：这是 dsh 的机制限制，不是登录态问题。dsh 把“设置持久化”门控在浏览器地址栏为 loopback（`127.0.0.1`/`localhost`）上；经门卫从外部域名/IP 访问时该判定为否，设置作用域进入内存模式——改动只在当次页面生效，刷新即丢。门卫已在服务端把请求伪装为 loopback 让 dsh 信任围栏放行，并默认注入客户端补丁（`clientLoopbackTrust: true`）把浏览器端连接标记同步为 loopback，从而恢复持久化（设置会正常写入 `~/.dsh/settings.yaml`）。若设置 `clientLoopbackTrust: false` 关闭补丁，将退回“设置不持久化”的旧行为。**注意：本修复不修改 dsh 任何源码，改的是门卫反向代理注入的浏览器端脚本；改动需重启 dsh 生效。**
+- **改了设置（深色模式、插话发送等）一刷新就还原**：这是 dsh 的机制限制，不是登录态问题。dsh 把“设置持久化”门控在浏览器地址栏为 loopback（`127.0.0.1`/`localhost`）上；经门卫从外部域名/IP 访问时该判定为否，设置作用域进入内存模式——改动只在当次页面生效，刷新即丢。门卫已通过**随包自带的浏览器端 client bundle**（`lib/client.js`，标准 `dsh.client` 接入，`immediately` 早于 dsh 各设置组件判定生效）把浏览器端连接标记为 loopback，从而恢复持久化（设置会正常写入 `~/.dsh/settings.yaml`）。该机制同时恢复了「设置-模型」「设置-插件-插件配置」（含 dsh 自带插件配置项）的正常显示。若设置 `clientLoopbackTrust: false` 关闭补丁，将退回“设置不持久化”的旧行为。**注意：本修复不修改 dsh 任何源码，改的是门卫插件自带的浏览器端 client bundle；改动需重启 dsh 生效。**
 - **设置-打开配置文件提示「无法打开配置文件」**：dsh 的该按钮会在服务器上调用系统级打开（Linux 走 `xdg-open`），无桌面环境（容器、无显示器服务器）上必然失败——这是宿主限制，不是登录态或门卫问题。门卫已默认提供兜底：探测到宿主无桌面环境时，自动把该按钮改为从门卫下载 `~/.dsh/settings.yaml`（`/__gateway/settings.yaml`，需登录）；桌面环境主机保持 dsh 原生打开。可在配置里关闭（`settingsFileDownload: false`）。
 
 ## 技术实现
@@ -188,7 +188,7 @@ rm -rf ~/.dsh-login-gateway/
 - 认证：`node:crypto` scrypt（`scrypt$N$r$p$salt$hash` 自描述格式），恒定时间比较防时序攻击。
 - 会话：内存 `Map` + 过期清理（30 分钟定时 sweep）。
 - 反代：流式透传（SSE 长连接友好），剔除 hop-by-hop 头，WebSocket 升级用后端 `rawHeaders` 原样构造 `101` 响应。
-- 兼容性补丁（HTML 注入，不改 dsh 源码）：loopback 信任补丁恢复经门卫访问时的设置持久化；无桌面环境时把「打开配置文件」改为门卫下载。
+- 兼容性补丁：经门卫访问时，用随包自带的**浏览器端 client bundle**（`lib/client.js`）把 dsh 连接标记为 loopback，恢复设置持久化（同时解决「设置-模型」「设置-插件-插件配置」显示问题），不改 dsh 源码；无桌面环境时把「打开配置文件」改为门卫下载。
 - 零运行时依赖，所有依赖仅存在于开发/测试环境。
 
 ## 目录结构
@@ -202,6 +202,9 @@ src/
   settings-file.js dsh 设置文件下载辅助（无桌面环境兜底）
   login-page.js   登录页 HTML（深色主题，单文件内联）
   setup-page.js   首次启动引导页 HTML（深色主题，单文件内联）
+lib/
+  client.js       浏览器端 client bundle（标准 dsh.client 接入）：把经门卫访问的连接
+                  标记为 loopback，恢复设置持久化与模型/插件配置显示，不改 dsh 源码
 bin/
   hash.js         密码哈希生成 CLI
 ```

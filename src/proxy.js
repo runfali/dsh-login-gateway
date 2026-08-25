@@ -39,6 +39,7 @@ export function rewriteHeaders(headers, targetHost, targetPort, { trustProxy = f
   for (const name of Object.keys(out)) {
     if (HOP_BY_HOP.has(name.toLowerCase())) delete out[name]
   }
+  delete out['proxy-connection']
   if (!trustProxy) {
     for (const h of PROXY_CHAIN_HEADERS) delete out[h]
   }

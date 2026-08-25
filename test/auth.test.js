@@ -5,7 +5,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { hashPassword, verifyPassword, SessionStore, LoginLimiter } from '../src/auth.js'
+import { hashPassword, verifyPassword, fakeVerify, safeEqualStr, SessionStore, LoginLimiter } from '../src/auth.js'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -97,4 +97,41 @@ test('LoginLimiter sweep 清理过期未锁定记录与已到期锁', async () =
   assert.equal(l.lockedBy('1.1.1.1', 'dave'), null)
   // 记录被清后剩余次数回到满额
   assert.equal(l.recordFailure('1.1.1.1', 'dave'), 99)
+})
+
+test('fakeVerify 消耗等价时间且不抛错（反枚举哑校验）', () => {
+  assert.doesNotThrow(() => fakeVerify('anything'))
+})
+
+test('safeEqualStr 恒定时间语义：相等/不等/长度不同/非字符串', () => {
+  const secret = 'ABCD-EFGH-IJKL'
+  assert.equal(safeEqualStr(secret, secret), true)
+  assert.equal(safeEqualStr(secret, 'ABCD-EFGH-IJKM'), false)
+  assert.equal(safeEqualStr(secret, 'short'), false) // 长度不同不抛错
+  assert.equal(safeEqualStr(secret, ''), false)
+  assert.equal(safeEqualStr(undefined, secret), false)
+  assert.equal(safeEqualStr(null, null), true)
+})
+
+test('SessionStore 容量上限逐出最旧会话', () => {
+  const s = new SessionStore(60_000, 3)
+  const t1 = s.create('a')
+  const t2 = s.create('b')
+  s.create('c')
+  const t4 = s.create('d') // 容量满，逐出 a
+  assert.equal(s.get(t1), null)
+  assert.ok(s.get(t2))
+  assert.ok(s.get(t4))
+})
+
+test('LoginLimiter 容量上限优先清过期、再逐出最旧', async () => {
+  const l = new LoginLimiter(5, 60_000, 20, 3) // maxKeys=3
+  l.recordFailure('1.1.1.1')
+  l.recordFailure('2.2.2.2')
+  await sleep(30) // 让前两条过期
+  l.recordFailure('3.3.3.3') // 满：应先清掉过期的 1/2 而不是逐出
+  l.recordFailure('4.4.4.4')
+  assert.ok(l.records.has('3.3.3.3'))
+  assert.ok(l.records.has('4.4.4.4'))
+  assert.ok(!l.records.has('1.1.1.1')) // 过期记录已被容量保障清理
 })

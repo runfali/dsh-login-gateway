@@ -8,6 +8,9 @@
     "dsh-login-gateway-hash": "bin/hash.js"
   },
   "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

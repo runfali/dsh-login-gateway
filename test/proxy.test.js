@@ -36,6 +36,78 @@ test('rewriteHeaders 剔除 proxy-connection', () => {
   assert.equal(out['proxy-connection'], undefined)
 })
 
+test('rewriteHeaders 剔除全部 hop-by-hop 请求头', () => {
+  const out = rewriteHeaders(
+    {
+      connection: 'keep-alive',
+      upgrade: 'websocket',
+      te: 'trailers',
+      trailer: 'x',
+      'transfer-encoding': 'chunked',
+      'keep-alive': 'timeout=5',
+      cookie: 'a=b', // 业务头保留
+    },
+    'h',
+    1,
+  )
+  for (const h of ['connection', 'upgrade', 'te', 'trailer', 'transfer-encoding', 'keep-alive']) {
+    assert.equal(out[h], undefined, `${h} 应被剔除`)
+  }
+  assert.equal(out.cookie, 'a=b')
+})
+
+test('rewriteHeaders CL+TE 并存时双删（防请求走私）', () => {
+  const out = rewriteHeaders(
+    { 'content-length': '10', 'transfer-encoding': 'chunked' },
+    'h',
+    1,
+  )
+  assert.equal(out['content-length'], undefined)
+  assert.equal(out['transfer-encoding'], undefined)
+})
+
+test('rewriteHeaders trustProxy=false 剥离伪造代理链头；true 时保留', () => {
+  const spoof = { 'x-forwarded-for': '1.2.3.4', 'x-real-ip': '1.2.3.4', forwarded: 'for=1.2.3.4' }
+  const stripped = rewriteHeaders(spoof, 'h', 1, { trustProxy: false })
+  for (const h of Object.keys(spoof)) assert.equal(stripped[h], undefined, `${h} 默认应被剥离`)
+  const kept = rewriteHeaders(spoof, 'h', 1, { trustProxy: true })
+  assert.equal(kept['x-forwarded-for'], '1.2.3.4')
+})
+
+test('injectTags 边界安全：<header> 不被误当 <head>', async () => {
+  // 经由真实反代验证注入点选择，见 gateway.test.js；这里直接驱动 proxy.js 内部逻辑
+  const { proxyRequest } = await import('../src/proxy.js')
+  const { startUpstream } = await import('./helpers.js')
+  const http = await import('node:http')
+
+  // 构造含 <header> 的 HTML，确认注入落在 </head> 前且不破坏 <header> 标签
+  const up = await startUpstream((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end('<html><head><title>t</title></head><body><header class="top">导航</header></body></html>')
+  })
+  const srv = http.createServer((req, res) => {
+    proxyRequest(req, res, '127.0.0.1', up.port, 5000, 5000, {})
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  try {
+    const body = await new Promise((resolve, reject) => {
+      http
+        .get({ host: '127.0.0.1', port: srv.address().port, path: '/' }, (res) => {
+          const chunks = []
+          res.on('data', (c) => chunks.push(c))
+          res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+        })
+        .on('error', reject)
+    })
+    assert.match(body, /<header class="top">导航<\/header>/) // <header> 完整保留
+    assert.match(body, /dsh-gw-logout-btn/) // 注入存在
+    assert.ok(body.indexOf('dsh-gw-logout-btn') < body.indexOf('<body>')) // 注入在 head 区
+  } finally {
+    await up.close()
+    await new Promise((r) => srv.close(r))
+  }
+})
+
 test('nativeOpenAvailable 与平台环境一致', () => {
   const expect =
     process.platform === 'darwin' || process.platform === 'win32'

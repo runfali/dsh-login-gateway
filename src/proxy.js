@@ -17,11 +17,31 @@ const HOP_BY_HOP = new Set([
   'te', 'trailer', 'transfer-encoding', 'upgrade',
 ])
 
-/** 改写请求头：Host/Origin/Sec-Fetch-Site 换成 loopback 形态；Sec-Fetch-Site 缺失时补齐 same-origin。 */
-export function rewriteHeaders(headers, targetHost, targetPort) {
+/** 攻击者可控、且上游无需信任的代理链头；trustProxy=false 时剥离。 */
+const PROXY_CHAIN_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-real-ip', 'forwarded']
+
+/**
+ * 改写请求头：
+ * - Host/Origin 换成 loopback 形态，Sec-Fetch-Site 一律 same-origin
+ *   （缺失时补齐，保证依赖同源校验的上游插件路由可用）
+ * - 剔除全部 hop-by-hop 头（connection/upgrade 等由调用方按需重设；
+ *   transfer-encoding 删除后 Node 会按实际流重新分块，顺带化解 CL+TE 走私）
+ * - Content-Length 与 Transfer-Encoding 并存时删除两者，杜绝歧义解析
+ * - trustProxy=false 时剥离伪造的 XFF/Forwarded 链头，防污染上游日志与判定
+ */
+export function rewriteHeaders(headers, targetHost, targetPort, { trustProxy = false } = {}) {
   const authority = `${targetHost}:${targetPort}`
   const out = { ...headers }
-  delete out['proxy-connection']
+  // CL+TE 并存属歧义请求（走私经典手法）：先双删，再走 hop-by-hop 清理
+  if (out['content-length'] !== undefined && out['transfer-encoding'] !== undefined) {
+    delete out['content-length']
+  }
+  for (const name of Object.keys(out)) {
+    if (HOP_BY_HOP.has(name.toLowerCase())) delete out[name]
+  }
+  if (!trustProxy) {
+    for (const h of PROXY_CHAIN_HEADERS) delete out[h]
+  }
   if (out.host !== undefined) out.host = authority
   if (out.origin !== undefined) out.origin = `http://${authority}`
   out['sec-fetch-site'] = 'same-origin'
@@ -166,17 +186,43 @@ const SETTINGS_DOWNLOAD_TAG = `<script>
 const INJECT_TAGS = POLYFILL_TAG + LOGOUT_BUTTON_TAG
 
 /**
- * 注入脚本：时机敏感的补丁（loopback 信任）插到 <head> 最前，保证先于任何
- * 应用脚本执行；常规注入（polyfill/退出按钮）仍在 </head> 前；
+ * 注入脚本：时机敏感的补丁（loopback 信任）插到 <head> 开标签后，保证先于任何
+ * 应用脚本执行；常规注入（polyfill/退出按钮/改密入口）仍在 </head> 前；
  * 无 </head> 则 </body> 前，都没有则追加末尾。
+ * 全部用带边界的正则匹配完整开/闭标签，避免 <head> 误匹配 <header>。
  */
+function insertAfter(html, regex, insert) {
+  const m = html.match(regex)
+  if (!m) return null
+  const at = m.index + m[0].length
+  return html.slice(0, at) + insert + html.slice(at)
+}
+
+function insertBefore(html, regex, insert) {
+  const m = html.match(regex)
+  if (!m) return null
+  return html.slice(0, m.index) + insert + html.slice(m.index)
+}
+
+const HEAD_OPEN = /<head(\s[^>]*)?>/i
+const HEAD_CLOSE = /<\/head\s*>/i
+const BODY_CLOSE = /<\/body\s*>/i
+
 function injectTags(html, extraTags = '') {
-  if (html.includes('<head>')) {
-    return html.replace('<head>', `<head>${extraTags}`).replace('</head>', `${INJECT_TAGS}</head>`)
+  const tail = INJECT_TAGS + extraTags
+  if (extraTags) {
+    let out = insertAfter(html, HEAD_OPEN, extraTags)
+    if (out !== null) {
+      const withTail = insertBefore(out, HEAD_CLOSE, INJECT_TAGS)
+      if (withTail !== null) return withTail
+      return out
+    }
   }
-  if (html.includes('</head>')) return html.replace('</head>', `${INJECT_TAGS + extraTags}</head>`)
-  if (html.includes('</body>')) return html.replace('</body>', `${INJECT_TAGS + extraTags}</body>`)
-  return html + INJECT_TAGS + extraTags
+  const a = insertBefore(html, HEAD_CLOSE, tail)
+  if (a !== null) return a
+  const b = insertBefore(html, BODY_CLOSE, tail)
+  if (b !== null) return b
+  return html + tail
 }
 
 /**
@@ -193,8 +239,8 @@ function injectTags(html, extraTags = '') {
  *   settingsDownload 无桌面环境时注入设置文件下载兜底，默认 false
  */
 export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 60_000, streamIdleTimeoutMs = 30 * 60_000, injectOpts = {}) {
-  const { clientLoopbackTrust = true, settingsDownload = false } = injectOpts
-  const headers = rewriteHeaders(req.headers, targetHost, targetPort)
+  const { clientLoopbackTrust = true, settingsDownload = false, trustProxy = false } = injectOpts
+  const headers = rewriteHeaders(req.headers, targetHost, targetPort, { trustProxy })
   const upstream = http.request({
     host: targetHost,
     port: targetPort,
@@ -275,9 +321,9 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
  * @param {Buffer} head
  * @param {number} [proxyTimeoutMs] 握手超时上限（毫秒），取与 15s 的较小值
  */
-export function proxyUpgrade(req, socket, head, targetHost, targetPort, proxyTimeoutMs = 60_000) {
+export function proxyUpgrade(req, socket, head, targetHost, targetPort, proxyTimeoutMs = 60_000, opts = {}) {
   const handshakeTimeout = Math.min(proxyTimeoutMs, 15_000)
-  const headers = rewriteHeaders(req.headers, targetHost, targetPort)
+  const headers = rewriteHeaders(req.headers, targetHost, targetPort, { trustProxy: Boolean(opts.trustProxy) })
   headers.connection = 'Upgrade'
   headers.upgrade = 'websocket'
 

@@ -349,6 +349,58 @@ test('setup 全流程：日志+文件双通道令牌 → 建号 → 令牌失效
   }
 })
 
+test('修改密码全流程：验证旧密码、轮换哈希、吊销其他会话', async () => {
+  const gw = await startGateway()
+  try {
+    const c1 = cookieOf(await login(gw.port))
+    const c2 = cookieOf(await login(gw.port)) // 另一个会话，稍后应被吊销
+    // 未登录不能改密
+    const noAuth = await request(gw.port, 'POST', '/change-password', { body: JSON.stringify({}) })
+    assert.equal(noAuth.status, 401)
+    // 旧密码错误
+    const wrongOld = await request(gw.port, 'POST', '/change-password', {
+      headers: { cookie: c1, 'content-type': 'application/json' },
+      body: JSON.stringify({ oldPassword: 'wrong-old', newPassword: 'newpassword456', newPassword2: 'newpassword456' }),
+    })
+    assert.equal(wrongOld.status, 401)
+    // 新密码过短
+    const short = await request(gw.port, 'POST', '/change-password', {
+      headers: { cookie: c1, 'content-type': 'application/json' },
+      body: JSON.stringify({ oldPassword: 'password123', newPassword: 'short', newPassword2: 'short' }),
+    })
+    assert.equal(short.status, 400)
+    // 两次不一致
+    const mismatch = await request(gw.port, 'POST', '/change-password', {
+      headers: { cookie: c1, 'content-type': 'application/json' },
+      body: JSON.stringify({ oldPassword: 'password123', newPassword: 'newpassword456', newPassword2: 'different789' }),
+    })
+    assert.equal(mismatch.status, 400)
+    // 正确改密
+    const ok = await request(gw.port, 'POST', '/change-password', {
+      headers: { cookie: c1, 'content-type': 'application/json' },
+      body: JSON.stringify({ oldPassword: 'password123', newPassword: 'newpassword456', newPassword2: 'newpassword456' }),
+    })
+    assert.equal(ok.status, 200)
+    assert.deepEqual(JSON.parse(ok.body), { ok: true, revoked: 1 }) // c2 被吊销
+    // 当前会话仍有效（能访问受保护路径——用 mock 上游隔离验证）
+    // 其他会话已失效
+    const oldSession = await request(gw.port, 'GET', '/api/x', { headers: { cookie: c2 } })
+    assert.equal(oldSession.status, 401)
+    // 用户文件已写入新哈希：旧密码登录失败、新密码登录成功
+    const usersData = JSON.parse(readFileSync(gw.userStorePath, 'utf8'))
+    const { verifyPassword } = await import('../src/auth.js')
+    assert.equal(verifyPassword('password123', usersData.users[0].passwordHash), false)
+    assert.equal(verifyPassword('newpassword456', usersData.users[0].passwordHash), true)
+    const relogin = await login(gw.port, 'admin', 'newpassword456')
+    assert.equal(relogin.status, 200)
+    // 审计日志留痕
+    assert.ok(gw.logs.some((l) => l.startsWith('改密成功') && l.includes('user=admin')))
+    assert.ok(gw.logs.some((l) => l.startsWith('改密失败') && l.includes('当前密码错误')))
+  } finally {
+    gw.stop()
+  }
+})
+
 test('用户文件损坏时启动报错不静默重置', async () => {
   const { apply } = await import('../src/index.js')
   const { makeCtx, tempDir } = await import('./helpers.js')

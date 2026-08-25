@@ -65,25 +65,88 @@ function stripHopByHop(headers) {
 const POLYFILL_TAG = '<script>(function(){if(typeof crypto!==\'undefined\'&&typeof crypto.randomUUID!==\'function\'){crypto.randomUUID=function(){var b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&0x0f)|0x40;b[8]=(b[8]&0x3f)|0x80;var h=\'\';for(var i=0;i<16;i++){h+=(b[i]<16?\'0\':\'\')+b[i].toString(16);if(i===3||i===5||i===7||i===9)h+=\'-\';}return h;};}})();</script>'
 
 /**
- * 悬浮"退出"按钮：dsh 页面无登出入口，门卫在反代 HTML 时注入。
- * 独立元素 id=dsh-gw-logout-btn，只创建自身不碰其他 DOM；
- * 点击 confirm 后 POST /logout（门卫接口）并跳转登录页。
+ * 悬浮"改密 / 退出"栏：dsh 页面无账号管理入口，门卫在反代 HTML 时注入。
+ * - 退出：confirm 后 POST /logout 并跳回登录页
+ * - 改密：内联对话框（当前密码 + 新密码 ×2）POST /change-password；
+ *   成功后服务端吊销其余会话，本会话保留。
+ * 全部 DOM API 构建，不碰 dsh 自身节点；样式与登录页同风格。
  */
 const LOGOUT_BUTTON_TAG = `<script>
 (function(){
+  var css = 'padding:6px 14px;font-size:13px;color:#fff;background:rgba(15,16,17,0.8);border:1px solid #2a2c33;border-radius:8px;cursor:pointer;transition:background 0.2s;'
+  var openDialog = function(){
+    if (document.getElementById('dsh-gw-pw-overlay')) return
+    var overlay = document.createElement('div')
+    overlay.id = 'dsh-gw-pw-overlay'
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(1,1,2,0.72);display:flex;align-items:center;justify-content:center;'
+    var card = document.createElement('div')
+    card.style.cssText = 'width:min(92vw,360px);background:#141516;border:1px solid #2a2c33;border-radius:12px;padding:24px;font-size:13px;color:#f7f8f8;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;'
+    var title = document.createElement('div'); title.textContent = '修改密码'; title.style.cssText='font-size:15px;margin-bottom:14px;'
+    card.appendChild(title)
+    var fields = [['当前密码','old-password'],['新密码（至少8位）','new-password'],['确认新密码','new-password2']]
+    var inputs = []
+    fields.forEach(function(f){
+      var label = document.createElement('div'); label.textContent = f[0]; label.style.cssText='margin:10px 0 6px;color:#d0d6e0;'
+      var input = document.createElement('input')
+      input.type = 'password'; input.placeholder = '请输入' + f[0]
+      input.style.cssText = 'width:100%;box-sizing:border-box;padding:9px 11px;font-size:13px;color:#f7f8f8;background:#010102;border:1px solid #2a2c33;border-radius:8px;outline:none;'
+      input.dataset.field = f[1]
+      label.appendChild(input); card.appendChild(label); inputs.push(input)
+    })
+    var msg = document.createElement('div'); msg.style.cssText='min-height:16px;margin-top:10px;color:#ff6363;font-size:12px;'; msg.setAttribute('role','alert')
+    var row = document.createElement('div'); row.style.cssText='display:flex;gap:8px;margin-top:12px;'
+    var cancel = document.createElement('button'); cancel.textContent='取消'
+    cancel.style.cssText = css + 'flex:1;background:#1c1e22;'
+    var submit = document.createElement('button'); submit.textContent='确认修改'
+    submit.style.cssText = css + 'flex:1;background:#3d5af0;border-color:#3d5af0;'
+    row.appendChild(cancel); row.appendChild(submit); card.appendChild(row); card.appendChild(msg)
+    overlay.appendChild(card); document.body.appendChild(overlay)
+    var close = function(){ overlay.remove() }
+    cancel.onclick = close
+    overlay.onclick = function(e){ if (e.target === overlay) close() }
+    submit.onclick = function(){
+      msg.textContent = ''
+      var v = {}
+      inputs.forEach(function(i){ v[i.dataset.field] = i.value })
+      if (!v['old-password'] || !v['new-password']) { msg.textContent = '请填写完整'; return }
+      if (v['new-password'] !== v['new-password2']) { msg.textContent = '两次输入的新密码不一致'; return }
+      submit.disabled = true
+      fetch('/change-password', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ oldPassword: v['old-password'], newPassword: v['new-password'], newPassword2: v['new-password2'] })
+      }).then(function(r){ return r.json().catch(function(){ return {} }) }).then(function(data){
+        submit.disabled = false
+        if (data && data.ok) {
+          msg.style.color = '#7ee787'
+          msg.textContent = '修改成功' + (data.revoked ? ('，已下线其他会话 ' + data.revoked + ' 个') : '')
+          setTimeout(close, 1500)
+        } else {
+          msg.textContent = (data && data.error) || '修改失败，请重试'
+        }
+      }).catch(function(){ submit.disabled = false; msg.textContent = '网络错误，请重试' })
+    }
+  }
   var mount = function(){
-    var b = document.createElement('button')
-    b.id = 'dsh-gw-logout-btn'
-    b.title = '退出登录'
-    b.textContent = '退出'
-    b.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:6px 14px;font-size:13px;color:#fff;background:rgba(15,16,17,0.8);border:1px solid #2a2c33;border-radius:8px;cursor:pointer;transition:background 0.2s;'
-    b.onmouseenter = function(){ b.style.background = 'rgba(40,44,54,0.9)' }
-    b.onmouseleave = function(){ b.style.background = 'rgba(15,16,17,0.8)' }
-    b.onclick = function(){
+    var bar = document.createElement('div')
+    bar.id = 'dsh-gw-bar'
+    bar.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;display:flex;gap:8px;'
+    var mkBtn = function(id, txt){
+      var b = document.createElement('button')
+      b.id = id; b.textContent = txt; b.title = txt; b.style.cssText = css
+      b.onmouseenter = function(){ b.style.background = 'rgba(40,44,54,0.9)' }
+      b.onmouseleave = function(){ b.style.background = 'rgba(15,16,17,0.8)' }
+      return b
+    }
+    var pw = mkBtn('dsh-gw-changepw-btn', '改密')
+    pw.onclick = openDialog
+    var logout = mkBtn('dsh-gw-logout-btn', '退出')
+    logout.onclick = function(){
       if (!confirm('确定退出登录吗？')) return
       fetch('/logout', { method: 'POST' }).finally(function(){ window.location.href = '/' })
     }
-    document.body.appendChild(b)
+    bar.appendChild(pw); bar.appendChild(logout)
+    document.body.appendChild(bar)
   }
   if (document.body) mount()
   else document.addEventListener('DOMContentLoaded', mount)

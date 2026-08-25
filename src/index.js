@@ -274,6 +274,45 @@ export function apply(ctx, config = {}) {
     return sendJson(res, 200, { ok: true })
   }
 
+  /**
+   * 修改密码：需登录会话 + 当前密码验证。
+   * 成功后吊销该用户名下除当前会话外的全部会话（凭据轮换后旧凭据残留访问失效）。
+   */
+  async function handleChangePassword(req, res, session, currentToken) {
+    const ip = getClientIp(req)
+    if (limiter.isLocked(ip, session.username)) {
+      return sendJson(res, 429, { error: `尝试次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
+    }
+    const body = await readJsonBody(req)
+    if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
+    const oldPassword = String(body.oldPassword ?? '')
+    const newPassword = String(body.newPassword ?? '')
+    const newPassword2 = String(body.newPassword2 ?? '')
+    const user = users.find((u) => u.username === session.username)
+    if (!user || !verifyPassword(oldPassword, user.passwordHash)) {
+      const remaining = limiter.recordFailure(ip, session.username)
+      log(`改密失败 ip=${clean(ip)} user=${clean(session.username)} 原因=当前密码错误 剩余=${remaining}`)
+      return sendJson(res, 401, { error: '当前密码不正确' })
+    }
+    if (newPassword.length < 8) return sendJson(res, 400, { error: '新密码长度至少 8 位' })
+    if (newPassword.length > 1024) return sendJson(res, 400, { error: '新密码过长' })
+    if (newPassword !== newPassword2) return sendJson(res, 400, { error: '两次输入的新密码不一致' })
+    if (newPassword === oldPassword) return sendJson(res, 400, { error: '新密码不能与当前密码相同' })
+    user.passwordHash = hashPassword(newPassword)
+    saveUsersSync(cfg.userStorePath, users)
+    // 吊销该用户其余会话（保留当前），防止旧会话在凭据轮换后继续使用
+    let revoked = 0
+    for (const [tok, s] of sessions.sessions) {
+      if (s.username === session.username && tok !== currentToken) {
+        sessions.delete(tok)
+        revoked += 1
+      }
+    }
+    limiter.reset(ip, session.username)
+    log(`改密成功 ip=${clean(ip)} user=${clean(session.username)} 吊销其他会话 ${revoked} 个`)
+    return sendJson(res, 200, { ok: true, revoked })
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url ?? '/', 'http://local')
     const pathname = url.pathname
@@ -311,7 +350,6 @@ export function apply(ctx, config = {}) {
       res.end()
       return
     }
-
     if (!session) {
       // 浏览器自动请求的纯静态元数据（manifest/favicon/robots.txt，无敏感信息）：
       // 仅放行幂等的 GET/HEAD，其余方法一律拒绝
@@ -327,7 +365,11 @@ export function apply(ctx, config = {}) {
     }
 
     // 门卫托管的设置文件下载（需登录）：宿主机无桌面环境时 dsh 原生打开必然失败，
-    // 改为由门卫直接下发文件（见 SETTINGS_DOWNLOAD_TAG 注入脚本）。
+    // 修改密码（需登录）：验证当前密码后轮换哈希并吊销其他会话
+    if (pathname === '/change-password') {
+      if (req.method !== 'POST') return sendText(res, 405, '仅支持 POST')
+      return handleChangePassword(req, res, session, cookies[COOKIE_NAME])
+    }
     if (cfg.settingsFileDownload && pathname === '/__gateway/settings.yaml') {
       if (req.method !== 'GET') return sendText(res, 405, '仅支持 GET')
       const payload = settingsFilePayload(cfg.settingsFilePath)

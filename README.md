@@ -141,6 +141,9 @@ rm -rf ~/.dsh-login-gateway/
 | `streamIdleTimeoutMs` | `1800000` | 反代响应流空闲超时（毫秒，默认 30 分钟） |
 | `maxConnections` | `512` | HTTP 服务最大并发连接数，超出后新连接被丢弃 |
 | `userStorePath` | `~/.dsh-login-gateway/users.json` | 用户数据文件路径（可自定义） |
+| `maxSessions` | `1000` | 会话容量上限，超出后逐出最旧会话，防止反复登录刷爆内存 |
+| `trustProxy` | `false` | 前置 TLS 反代（nginx/caddy）时设 `true`：从 `X-Forwarded-For` 取真实客户端 IP 参与限速。**直连场景必须保持 `false`**，否则攻击者可伪造该头绕过限速；为 `false` 时门卫会剥离伪造的 XFF/X-Real-IP/Forwarded 头再转发上游 |
+| `secureCookie` | `false` | 仅经 HTTPS 访问门卫时设 `true`：会话 Cookie 追加 `Secure` 标记 |
 | `clientLoopbackTrust` | `true` | 经门卫访问时，通过随包自带的浏览器端 client bundle（`lib/client.js`）把 dsh 连接标记为 loopback，恢复设置持久化（深色模式、插话发送等），同时保证「设置-模型」「设置-插件-插件配置」正常显示。设 `false` 可关闭（设置将退回不持久化） |
 | `settingsFilePath` | `~/.dsh/settings.yaml` | dsh 设置文件路径（供下载路由使用，一般无需改动） |
 | `settingsFileDownload` | `true` | 宿主机无桌面环境（容器/无显示器服务器）时，把 dsh 设置页的「打开配置文件」按钮改为从门卫下载该文件（`/__gateway/settings.yaml`）；桌面环境主机自动保持 dsh 原生打开。设 `false` 关闭该兜底 |
@@ -148,19 +151,24 @@ rm -rf ~/.dsh-login-gateway/
 ## 使用说明
 
 - **登录**：打开 `http://<主机>:3081/`，输入用户名密码。成功后会种下会话 Cookie（`dsh_gw_session`，`HttpOnly` + `SameSite=Strict`），之后访问全部走反代，包括 WebSocket。
-- **登出**：`POST /logout`。页面无入口时可直接调用：`curl -X POST http://<主机>:3081/logout`。
+- **修改密码**：页面右下角悬浮栏点「改密」，验证当前密码后设置新密码（至少 8 位）。改密成功会**自动下线该账号的其他所有会话**（当前浏览器保持登录），旧凭据即使泄露也随即失效。
+- **登出**：悬浮栏「退出」按钮；无界面时可直接调用：`curl -X POST http://<主机>:3081/logout`。
 - **未登录访问**：`/` 返回登录页；其余路径返回 `401` JSON。
 - **登录限速**：同一 IP 连续输错 `maxLoginAttempts` 次会被锁定 `lockMinutes` 分钟。
 - **账号锁定**：同一用户名跨 IP 累计失败 `maxLoginAttempts` 次也会被锁定，可防代理池分布式爆破。
 - **初始化限速**：`/setup` 同样按 IP 限速，令牌错误、用户名空、密码过短、两次密码不一致都计失败。
+- **审计日志**：登录成功/失败、锁定触发、登出、改密、初始化全程留痕（含来源 IP 与用户名），可在 dsh 日志中检索 `login-gateway` 前缀审计。
 
 ## 安全说明
 
-- **务必走 HTTPS**：门卫本身只做 HTTP 登录 + 反代，公网直接暴露会有明文传输风险。建议前置 Nginx/Caddy/云负载均衡做 TLS 终止（例如 `443 -> 127.0.0.1:3081`）。
-- **会话 Cookie** 使用 `HttpOnly` + `SameSite=Strict`，页面无 XSS 注入点。
-- **一次性令牌**为 32 位随机十六进制（128 bit 熵），只在未初始化时有效；初始化完成后立即失效并删除令牌文件。
+- **务必走 HTTPS**：门卫本身只做 HTTP 登录 + 反代，公网直接暴露会有明文传输风险。建议前置 Nginx/Caddy/云负载均衡做 TLS 终止（例如 `443 -> 127.0.0.1:3081`），此时在门卫配置里同时开启 `trustProxy: true` 与 `secureCookie: true`。
+- **会话 Cookie** 使用 `HttpOnly` + `SameSite=Strict`，页面无 XSS 注入点；改密成功自动吊销其他全部会话。
+- **一次性令牌**为 32 位随机十六进制（128 bit 熵），恒定时间比较防时序侧信道，只在未初始化时有效；初始化完成后立即失效并删除令牌文件。
 - **用户文件**默认在 `~/.dsh-login-gateway/users.json`，内含 scrypt 哈希（不可逆）；写入时自动使用 `0600` 权限、目录自动 `0700`。
-- **登录/初始化限速**按来源 IP 与用户名双维度独立计算，失败记录带 TTL，避免内存无限膨胀。
+- **登录/初始化限速**按来源 IP 与用户名双维度独立计算，失败记录带 TTL，避免内存无限膨胀；限速表与会话表均有容量上限（默认 1 万条 / 1000 个），防伪造海量 IP 或反复登录刷爆内存。
+- **反用户名枚举**：登录时账号不存在也会执行等价的 scrypt 计算，成功与失败的响应耗时无差异。
+- **反请求走私**：反代剔除全部 hop-by-hop 请求头；`Content-Length` 与 `Transfer-Encoding` 并存的歧义请求两头皆删、由 Node 按实际流重新分块。
+- **审计日志**：登录成败、锁定、登出、改密全程留痕（IP+用户名），日志字段净化换行与控制字符防伪造条目。
 - **反代超时**：上游响应头等待超 `proxyTimeoutMs` 返回 `504`；响应头到达后改用 `streamIdleTimeoutMs` 空闲超时，SSE 长间隔输出不会被正常打断。
 - **并发连接上限**：`maxConnections` 默认 `512`，并显式收紧 `headersTimeout`、`requestTimeout`、`keepAliveTimeout`，减少慢连接占用。
 - **安全响应头**：门卫自己生成的响应统一带 `X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 和 CSP；反代透传的 dsh 响应保持原样。
@@ -168,7 +176,7 @@ rm -rf ~/.dsh-login-gateway/
 
 ## 重置与常见问题
 
-- **重置管理员账号**：删除用户文件后重启 dsh，会再次进入“未初始化”状态，并重新打印一次性令牌：
+- **重置管理员账号**：优先用页面右下角「改密」入口在线轮换（需记得当前密码）。密码彻底遗失时，删除用户文件后重启 dsh，会再次进入“未初始化”状态，并重新打印一次性令牌：
 
   ```bash
   rm -f ~/.dsh-login-gateway/users.json
@@ -185,19 +193,27 @@ rm -rf ~/.dsh-login-gateway/
 
 ## 技术实现
 
-- 认证：`node:crypto` scrypt（`scrypt$N$r$p$salt$hash` 自描述格式），恒定时间比较防时序攻击。
-- 会话：内存 `Map` + 过期清理（30 分钟定时 sweep）。
-- 反代：流式透传（SSE 长连接友好），剔除 hop-by-hop 头，WebSocket 升级用后端 `rawHeaders` 原样构造 `101` 响应。
+- 认证：`node:crypto` scrypt（`scrypt$N$r$p$salt$hash` 自描述格式），恒定时间比较防时序攻击；登录时账号不存在也执行等价计算防用户名枚举。
+- 会话：内存 `Map` + 过期清理（30 分钟定时 sweep）+ 容量上限（逐出最旧）。
+- 反代：流式透传（SSE 长连接友好），剔除 hop-by-hop 头、化解 CL+TE 歧义请求，WebSocket 升级用后端 `rawHeaders` 原样构造 `101` 响应。
 - 兼容性补丁：经门卫访问时，用随包自带的**浏览器端 client bundle**（`lib/client.js`）把 dsh 连接标记为 loopback，恢复设置持久化（同时解决「设置-模型」「设置-插件-插件配置」显示问题），不改 dsh 源码；无桌面环境时把「打开配置文件」改为门卫下载。
 - 零运行时依赖，所有依赖仅存在于开发/测试环境。
+
+## 测试
+
+```bash
+npm test   # node --test test/（零依赖，node:test 内置框架）
+```
+
+覆盖：密码哈希与篡改检测、会话过期/容量上限、限速锁定/双维度/TTL、请求头改写与走私防护、注入点边界安全、认证闸门、反代透传、WS 升级握手、setup 引导全流程、改密与会话吊销、审计日志与日志注入净化。
 
 ## 目录结构
 
 ```text
 src/
-  index.js        插件主入口：配置校验、路由分发、setup 引导、HTTP 服务 + WS 升级
-  auth.js         密码哈希（scrypt）、会话存储、登录限速
-  proxy.js        HTTP 反代（头改写 + hop-by-hop 剔除）与 WebSocket 升级转发
+  index.js        插件主入口：配置校验、路由分发、setup 引导、改密、审计日志、HTTP 服务 + WS 升级
+  auth.js         密码哈希（scrypt）、会话存储（容量上限）、登录限速（双维度+TTL）、恒定时间比较
+  proxy.js        HTTP 反代（头改写 + hop-by-hop 剔除 + 走私防护）与 WebSocket 升级转发
   user-store.js   用户文件存储（JSON + 原子写入）
   settings-file.js dsh 设置文件下载辅助（无桌面环境兜底）
   login-page.js   登录页 HTML（深色主题，单文件内联）
@@ -207,4 +223,9 @@ lib/
                   标记为 loopback，恢复设置持久化与模型/插件配置显示，不改 dsh 源码
 bin/
   hash.js         密码哈希生成 CLI
+test/
+  helpers.js      测试基建：假 cordis ctx / 网关启动器 / 模拟上游 / HTTP 客户端
+  auth.test.js    认证核心单测
+  proxy.test.js   反代头处理单测
+  gateway.test.js 端到端集成测试（认证闸门/反代/setup/WS/改密/审计）
 ```

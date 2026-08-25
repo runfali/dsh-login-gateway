@@ -159,14 +159,18 @@ test('HTML 响应被注入退出按钮脚本', async () => {
   }
 })
 
-test('未登录静态资源仅放行 GET/HEAD，POST 拒绝', async () => {
+test('未登录静态资源由门卫自产空响应（去指纹），仅 GET/HEAD', async () => {
   const up = await startUpstream((req, res) => res.end('asset'))
   const gw = await startGateway({ targetPort: up.port })
   try {
     const get = await request(gw.port, 'GET', '/favicon.ico')
-    assert.equal(get.status, 200)
-    const head = await request(gw.port, 'HEAD', '/favicon.ico')
-    assert.equal(head.status, 200)
+    assert.equal(get.status, 204)
+    assert.equal(get.body, '') // 不反代真 dsh 资源（防 "DeepSeek Harness" 指纹泄露）
+    const head = await request(gw.port, 'HEAD', '/manifest.webmanifest')
+    assert.equal(head.status, 204)
+    const robots = await request(gw.port, 'GET', '/robots.txt')
+    assert.equal(robots.status, 200)
+    assert.match(robots.body, /Disallow: \//) // 防搜索引擎收录
     const post = await request(gw.port, 'POST', '/favicon.ico', { body: 'x' })
     assert.equal(post.status, 401)
     const other = await request(gw.port, 'GET', '/secret.txt')
@@ -331,7 +335,7 @@ test('setup 全流程：日志+文件双通道令牌 → 建号 → 令牌失效
     // 正确创建管理员
     const ok = await request(gw.port, 'POST', '/setup', {
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token, username: 'boss', password: 'password123', password2: 'password123' }),
+      body: JSON.stringify({ token, username: 'boss', password: 'Str0ng!Pass9', password2: 'Str0ng!Pass9' }),
     })
     assert.equal(ok.status, 200)
     assert.ok(existsSync(gw.userStorePath)) // 用户文件落盘
@@ -342,7 +346,7 @@ test('setup 全流程：日志+文件双通道令牌 → 建号 → 令牌失效
     assert.equal(gone.status, 410)
 
     // 新账号可正常登录
-    const lg = await login(gw.port, 'boss', 'password123')
+    const lg = await login(gw.port, 'boss', 'Str0ng!Pass9')
     assert.equal(lg.status, 200)
   } finally {
     gw.stop()
@@ -401,6 +405,132 @@ test('修改密码全流程：验证旧密码、轮换哈希、吊销其他会�
   }
 })
 
+test('全局认证节流：超限 429 且不再消耗 scrypt（防 CPU 打满）', async () => {
+  const gw = await startGateway({ globalAuthRatePerMinute: 3 })
+  try {
+    const statuses = []
+    for (let i = 0; i < 6; i++) {
+      const r = await request(gw.port, 'POST', '/login', {
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: `u${i}`, password: 'whatever123' }), // 每次不同用户名，绕开双维度锁
+      })
+      statuses.push(r.status)
+    }
+    // 前 3 个进入 scrypt 计算（401），后 3 个被全局节流（429）
+    assert.deepEqual(statuses, [401, 401, 401, 429, 429, 429])
+  } finally {
+    gw.stop()
+  }
+})
+
+test('setup 与改密拒绝弱口令', async () => {
+  // setup 阶段
+  const gw = await startGateway({}, false)
+  try {
+    const line = gw.logs.find((l) => l.includes('一次性令牌'))
+    const token = line.match(/令牌：([A-Z0-9-]+)/)[1]
+    const weak = await request(gw.port, 'POST', '/setup', {
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, username: 'boss', password: '12345678', password2: '12345678' }),
+    })
+    assert.equal(weak.status, 400)
+    assert.match(JSON.parse(weak.body).error, /常见|纯数字/)
+    // 纯数字
+    const digits = await request(gw.port, 'POST', '/setup', {
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, username: 'boss', password: '98765432', password2: '98765432' }),
+    })
+    assert.match(JSON.parse(digits.body).error, /纯数字/)
+  } finally {
+    gw.stop()
+  }
+  // 改密阶段
+  const gw2 = await startGateway()
+  try {
+    const cookie = cookieOf(await login(gw2.port))
+    const r = await request(gw2.port, 'POST', '/change-password', {
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ oldPassword: 'password123', newPassword: 'qwerty123', newPassword2: 'qwerty123' }),
+    })
+    assert.equal(r.status, 400)
+    assert.match(JSON.parse(r.body).error, /常见/)
+  } finally {
+    gw2.stop()
+  }
+})
+
+test('门卫自产响应带 Cache-Control: no-store', async () => {
+  const gw = await startGateway()
+  try {
+    const page = await request(gw.port, 'GET', '/')
+    assert.equal(page.headers['cache-control'], 'no-store')
+    const denied = await request(gw.port, 'GET', '/api/x')
+    assert.equal(denied.headers['cache-control'], 'no-store')
+  } finally {
+    gw.stop()
+  }
+})
+
+test('会话绑定 User-Agent：异 UA 复用 Cookie 被拒并吊销', async () => {
+  const gw = await startGateway({ bindUserAgent: true })
+  try {
+    // 用显式 UA 登录
+    const r = await request(gw.port, 'POST', '/login', {
+      headers: { 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0 OfficePC' },
+      body: JSON.stringify({ username: 'admin', password: 'password123' }),
+    })
+    assert.equal(r.status, 200)
+    const cookie = cookieOf(r)
+    // 同 UA 正常访问
+    const same = await request(gw.port, 'GET', '/api/x', {
+      headers: { cookie, 'user-agent': 'Mozilla/5.0 OfficePC' },
+    })
+    assert.ok(same.status !== 401) // 会话有效
+    // 换 UA 偷用同一 Cookie → 401（且该会话被吊销）
+    const stolen = await request(gw.port, 'GET', '/api/x', {
+      headers: { cookie, 'user-agent': 'curl/8.0 Attacker' },
+    })
+    assert.equal(stolen.status, 401)
+    // 原 UA 也已失效（会话被吊销而非仅拒绝）
+    const afterRevoke = await request(gw.port, 'GET', '/api/x', {
+      headers: { cookie, 'user-agent': 'Mozilla/5.0 OfficePC' },
+    })
+    assert.equal(afterRevoke.status, 401)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('bindUserAgent=false 时换 UA 不影响会话', async () => {
+  const gw = await startGateway({ bindUserAgent: false })
+  try {
+    const r = await login(gw.port)
+    const cookie = cookieOf(r)
+    const other = await request(gw.port, 'GET', '/api/x', {
+      headers: { cookie, 'user-agent': 'SomeOtherUA/1.0' },
+    })
+    assert.notEqual(other.status, 401)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('tls.enabled 但证书不可读时启动显式失败（fail-fast）', async () => {
+  const { apply } = await import('../src/index.js')
+  const { makeCtx } = await import('./helpers.js')
+  const pack = makeCtx()
+  const port = await (await import('./helpers.js')).freePort()
+  assert.throws(
+    () =>
+      apply(pack.ctx, {
+        listenHost: '127.0.0.1',
+        listenPort: port,
+        tls: { enabled: true, certPath: '/nonexistent/cert.pem', keyPath: '/nonexistent/key.pem' },
+      }),
+    /TLS 证书\/私钥读取失败/,
+  )
+})
+
 test('用户文件损坏时启动报错不静默重置', async () => {
   const { apply } = await import('../src/index.js')
   const { makeCtx, tempDir } = await import('./helpers.js')
@@ -429,13 +559,13 @@ test('审计日志：登录成功/失败/锁定均留痕（IP+用户名，净化
     const token = line.match(/令牌：([A-Z0-9-]+)/)[1]
     await request(gw.port, 'POST', '/setup', {
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token, username: 'boss', password: 'password123', password2: 'password123' }),
+      body: JSON.stringify({ token, username: 'boss', password: 'Str0ng!Pass9', password2: 'Str0ng!Pass9' }),
     })
     // 失败一次（含日志注入尝试）
     const evilUser = 'bo\nss2026-01-01 INJECTED'
     await login(gw.port, evilUser, 'nope')
     // 成功一次
-    await login(gw.port, 'boss', 'password123')
+    await login(gw.port, 'boss', 'Str0ng!Pass9')
     const joined = gw.logs.join('\n')
     assert.ok(gw.logs.some((l) => l.startsWith('登录失败 ip=') && l.includes('user=')), '应有登录失败审计')
     assert.ok(gw.logs.some((l) => l.startsWith('登录成功 ip=') && l.includes('user=boss')), '应有登录成功审计')

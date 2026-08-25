@@ -144,6 +144,9 @@ rm -rf ~/.dsh-login-gateway/
 | `maxSessions` | `1000` | 会话容量上限，超出后逐出最旧会话，防止反复登录刷爆内存 |
 | `trustProxy` | `false` | 前置 TLS 反代（nginx/caddy）时设 `true`：从 `X-Forwarded-For` 取真实客户端 IP 参与限速。**直连场景必须保持 `false`**，否则攻击者可伪造该头绕过限速；为 `false` 时门卫会剥离伪造的 XFF/X-Real-IP/Forwarded 头再转发上游 |
 | `secureCookie` | `false` | 仅经 HTTPS 访问门卫时设 `true`：会话 Cookie 追加 `Secure` 标记 |
+| `globalAuthRatePerMinute` | `30` | 全局认证节流：每分钟最多 `30` 次触发密码计算的尝试（登录+改密合计，超限直接 429 不消耗计算）。防止攻击者轮换 IP+用户名绕开双维度锁定后打满 CPU |
+| `bindUserAgent` | `true` | 会话绑定 User-Agent：被嗅探的 Cookie 在不同客户端上不可复用（异 UA 访问会立即吊销该会话）。浏览器升级换 UA 后需重新登录一次；设 `false` 关闭 |
+| `tls` | 不启用 | 门卫自身 TLS。HTTP 直连场景下为密码与会话提供传输加密：`tls: { enabled: true, certPath: '/path/cert.pem', keyPath: '/path/key.pem' }`。启用后 `secureCookie` 自动开启、日志地址变 `https://`。自签证书一行生成见下文「HTTP 直连场景安全清单」。证书路径错误时插件启动显式失败（绝不静默回退明文） |
 | `clientLoopbackTrust` | `true` | 经门卫访问时，通过随包自带的浏览器端 client bundle（`lib/client.js`）把 dsh 连接标记为 loopback，恢复设置持久化（深色模式、插话发送等），同时保证「设置-模型」「设置-插件-插件配置」正常显示。设 `false` 可关闭（设置将退回不持久化） |
 | `settingsFilePath` | `~/.dsh/settings.yaml` | dsh 设置文件路径（供下载路由使用，一般无需改动） |
 | `settingsFileDownload` | `true` | 宿主机无桌面环境（容器/无显示器服务器）时，把 dsh 设置页的「打开配置文件」按钮改为从门卫下载该文件（`/__gateway/settings.yaml`）；桌面环境主机自动保持 dsh 原生打开。设 `false` 关闭该兜底 |
@@ -160,6 +163,36 @@ rm -rf ~/.dsh-login-gateway/
 - **审计日志**：登录成功/失败、锁定触发、登出、改密、初始化全程留痕（含来源 IP 与用户名），可在 dsh 日志中检索 `login-gateway` 前缀审计。
 
 ## 安全说明
+
+### HTTP 直连场景安全清单（http://ip:3081 直接使用）
+
+本插件的典型用法就是**不套 nginx、直接 `http://<IP>:3081` 访问**。明文 HTTP 的固有风险是：同一链路上的设备可嗅探到你的密码与会话 Cookie，中间人还可以篡改登录页。门卫已内置多层缓解，按需逐条核对：
+
+1. **传输加密（强烈建议）**：给门卫开自身 TLS——自签证书一行生成：
+
+   ```bash
+   mkdir -p ~/.dsh-login-gateway/tls
+   openssl req -x509 -newkey rsa:2048 -keyout ~/.dsh-login-gateway/tls/key.pem \
+     -out ~/.dsh-login-gateway/tls/cert.pem -days 3650 -nodes -subj '/CN=dsh-gw'
+   ```
+
+   然后在 profile 用户层配置里加（整段替换 config 时记得带上其他要改的项）：
+
+   ```yaml
+   - id: login-gateway
+     config:
+       tls: { enabled: true, certPath: '/root/.dsh-login-gateway/tls/cert.pem', keyPath: '/root/.dsh-login-gateway/tls/key.pem' }
+       secureCookie: true
+   ```
+
+   重启后用 `https://<IP>:3081` 访问；浏览器会提示"证书不受信任"（自签的固有现象），点继续即可——**加密已经生效**，嗅探者只能看到密文。不想看到告警就把 cert.pem 导入系统/浏览器信任库。
+2. **会话绑定 UA（默认开启）**：即使 Cookie 被嗅探走，攻击者在自己的客户端上复用会被立即识别并吊销会话。代价：浏览器大版本升级换了 UA 后需要重新登录一次。
+3. **爆破防线（默认全开）**：IP+用户名双维度锁定、全局每分钟认证节流（默认 30 次）、密码计算恒时、用户名不存在也消耗等价计算。新设密码会拒绝常见弱口令/纯数字/重复字符——`12345678` 这类密码已无法通过初始化与改密。
+4. **未登录零指纹**：登录页之外的静态资源（manifest/favicon）由门卫返回空响应，不再反代真实 dsh 资源——扫描器无法从未登录态确认这是 dsh；robots.txt 明确禁止收录。
+5. **限速按直连 IP 生效**：直连场景保持 `trustProxy: false`（默认），伪造 XFF 无法绕过限速。
+6. **缩短暴露窗口（可选）**：把 `sessionTtlHours` 从默认 24 调小（如 8），Cookie 泄露后的可用窗口同步变短。
+
+其余通用安全设计见下。
 
 - **务必走 HTTPS**：门卫本身只做 HTTP 登录 + 反代，公网直接暴露会有明文传输风险。建议前置 Nginx/Caddy/云负载均衡做 TLS 终止（例如 `443 -> 127.0.0.1:3081`），此时在门卫配置里同时开启 `trustProxy: true` 与 `secureCookie: true`。
 - **会话 Cookie** 使用 `HttpOnly` + `SameSite=Strict`，页面无 XSS 注入点；改密成功自动吊销其他全部会话。

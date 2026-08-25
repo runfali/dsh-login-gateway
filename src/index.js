@@ -10,13 +10,14 @@
  */
 
 import http from 'node:http'
+import https from 'node:https'
 import os from 'node:os'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { hashPassword, fakeVerify, LoginLimiter, safeEqualStr, SessionStore, verifyPassword } from './auth.js'
+import { checkNewPassword, fakeVerify, GlobalAuthThrottle, hashPassword, LoginLimiter, safeEqualStr, SessionStore, uaBindKey, verifyPassword } from './auth.js'
 import { nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
 import { defaultSettingsFilePath, settingsFilePayload } from './settings-file.js'
 import { loadUsersSync, saveUsersSync } from './user-store.js'
@@ -79,10 +80,12 @@ async function readJsonBody(req) {
  * 防 Referer 泄漏、CSP 限制加载来源（内联样式/脚本必须 unsafe-inline）。
  * 反代透传的 dsh 响应不加（保持透传原样）。
  */
+/** 门卫自产响应统一安全头（认证相关响应一律 no-store 防中间缓存残留）。 */
 function sendSecurityHeaders(res) {
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Referrer-Policy', 'no-referrer')
   res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+  res.setHeader('Cache-Control', 'no-store')
 }
 
 function sendJson(res, status, data) {
@@ -130,6 +133,23 @@ function removeSetupToken(userStorePath, log) {
   }
 }
 
+/** 门卫自身 TLS 配置规范化：enabled 时证书与私钥必须可读，否则显式抛错（fail-fast）。 */
+function normalizeTlsConfig(raw) {
+  if (!raw || raw.enabled !== true) return null
+  if (typeof raw.certPath !== 'string' || typeof raw.keyPath !== 'string') {
+    throw new Error('tls.enabled=true 需要提供 tls.certPath 与 tls.keyPath')
+  }
+  let cert
+  let key
+  try {
+    cert = readFileSync(raw.certPath)
+    key = readFileSync(raw.keyPath)
+  } catch (err) {
+    throw new Error(`TLS 证书/私钥读取失败：${err?.message ?? err}（certPath=${raw.certPath}）`)
+  }
+  return { cert, key }
+}
+
 export function apply(ctx, config = {}) {
   const cfg = {
     listenHost: config.listenHost ?? '0.0.0.0',
@@ -151,17 +171,27 @@ export function apply(ctx, config = {}) {
     // 前置 TLS 反代（nginx/caddy）场景设 true：从 X-Forwarded-For 取真实客户端 IP，
     // 让限速按真实来源生效。直连场景必须保持 false，否则攻击者可伪造 XFF 绕过限速。
     trustProxy: config.trustProxy ?? false,
-    // Cookie Secure 标记：仅经 HTTPS 访问门卫时开启（前置 TLS 反代场景）
-    secureCookie: config.secureCookie ?? false,
+    // Cookie Secure 标记：未显式配置时跟随 tls.enabled（HTTPS 下自动开启）
+    secureCookie: config.secureCookie ?? Boolean(config.tls?.enabled),
     // 会话容量上限：防止反复登录刷爆内存
     maxSessions: config.maxSessions ?? 1000,
+    // 全局认证计算节流：每分钟最多允许多少次「触发 scrypt 的尝试」（登录+改密合计），
+    // 超限直接 429，不消耗哈希计算——防绕过双维度锁定后打满 CPU
+    globalAuthRatePerMinute: config.globalAuthRatePerMinute ?? 30,
+    // 会话绑定 User-Agent：HTTP 直连场景下被嗅探的 Cookie 在不同客户端上不可复用；
+    // 浏览器升级换 UA 后需重新登录。设 false 可关闭。
+    bindUserAgent: config.bindUserAgent ?? true,
   }
+  // 门卫自身 TLS（可选）：http+ip 直连场景下为密码与会话提供传输加密。
+  // 配置错误必须显式失败——静默回退明文会让用户误以为已加密。
+  const tlsCfg = normalizeTlsConfig(config.tls)
   // config.users 种子机制已废弃（会造成"默认用户"）：配置里仍有 users 字段时忽略，不报错。
   // 新装一律强制走 /setup 引导创建账号；本地无用户数据 = 未初始化。
   const log = getLog(ctx)
   const sessions = new SessionStore(cfg.sessionTtlHours * 3600_000, cfg.maxSessions)
   const limiter = new LoginLimiter(cfg.maxLoginAttempts, cfg.lockMinutes * 60_000)
   const setupLimiter = new LoginLimiter(cfg.setupMaxAttempts, cfg.setupLockMinutes * 60_000)
+  const authThrottle = new GlobalAuthThrottle(cfg.globalAuthRatePerMinute)
   let users = null
   let initialized = false
   let setupToken = null
@@ -186,6 +216,17 @@ export function apply(ctx, config = {}) {
     const parts = [`${COOKIE_NAME}=${value}`, `Max-Age=${maxAgeSeconds}`, 'Path=/', 'HttpOnly', 'SameSite=Strict']
     if (cfg.secureCookie) parts.push('Secure')
     return parts.join('; ')
+  }
+
+  /** secureCookie（即 HTTPS 部署）时对门卫自产响应补 HSTS。 */
+  /**
+   * 全局认证节流闸：login / change-password 中所有会触发 scrypt 的尝试必须先过。
+   * 超限返回 true 并已写好 429 响应。
+   */  function authThrottled(req, res, kind) {
+    if (authThrottle.acquire()) return false
+    log(`认证节流触发 ip=${clean(getClientIp(req))} kind=${kind}`)
+    sendJson(res, 429, { error: '尝试过于频繁，请一分钟后再试' })
+    return true
   }
 
   // 用户加载：文件存在 → 已初始化；不存在 → 未初始化
@@ -216,16 +257,19 @@ export function apply(ctx, config = {}) {
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
     const username = String(body.username ?? '').trim()
     const password = String(body.password ?? '')
-    const preLock = limiter.lockedBy(ip, username)
+    // 用户名维度的限速键统一小写，防 'Admin'/'ADMIN' 变体稀释锁定
+    const usernameKey = username.toLowerCase()
+    const preLock = limiter.lockedBy(ip, usernameKey)
     if (preLock) {
       log(`登录拒绝（已锁定） ip=${clean(ip)} user=${clean(username)}`)
       return sendJson(res, 401, { error: lockMsg(preLock) })
     }
+    if (authThrottled(req, res, 'login')) return
     const user = users.find((u) => u.username === username)
     if (!user || !verifyPassword(password, user.passwordHash)) {
       if (!user) fakeVerify(password) // 反枚举：不存在也消耗等价计算
-      const remaining = limiter.recordFailure(ip, username)
-      const lock = limiter.lockedBy(ip, username)
+      const remaining = limiter.recordFailure(ip, usernameKey)
+      const lock = limiter.lockedBy(ip, usernameKey)
       if (lock) {
         log(`登录失败并触发锁定 ip=${clean(ip)} user=${clean(username)}`)
         return sendJson(res, 401, { error: lockMsg(lock) })
@@ -233,8 +277,8 @@ export function apply(ctx, config = {}) {
       log(`登录失败 ip=${clean(ip)} user=${clean(username)} 剩余=${remaining}`)
       return sendJson(res, 401, { error: `用户名或密码错误，剩余可尝试次数：${remaining}` })
     }
-    limiter.reset(ip, username)
-    const token = sessions.create(user.username)
+    limiter.reset(ip, usernameKey)
+    const token = sessions.create(user.username, cfg.bindUserAgent ? uaBindKey(req.headers['user-agent']) : null)
     res.setHeader('Set-Cookie', sessionCookie(token, cfg.sessionTtlHours * 3600))
     log(`登录成功 ip=${clean(ip)} user=${clean(username)}`)
     return sendJson(res, 200, { ok: true })
@@ -263,6 +307,8 @@ export function apply(ctx, config = {}) {
     if (!username) return fail('用户名不能为空')
     if (username.length > 64) return fail('用户名长度不能超过 64 个字符')
     if (password.length < 8) return fail('密码长度至少 8 位')
+    const weakReason = checkNewPassword(password)
+    if (weakReason) return fail(weakReason)
     if (password !== password2) return fail('两次输入的密码不一致')
     setupLimiter.reset(ip)
     users = [{ username, passwordHash: hashPassword(password), createdAt: new Date().toISOString() }]
@@ -280,22 +326,28 @@ export function apply(ctx, config = {}) {
    */
   async function handleChangePassword(req, res, session, currentToken) {
     const ip = getClientIp(req)
-    if (limiter.isLocked(ip, session.username)) {
+    if (limiter.isLocked(ip, session.username.toLowerCase())) {
       return sendJson(res, 429, { error: `尝试次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
     }
     const body = await readJsonBody(req)
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
+    if (authThrottled(req, res, 'change-password')) return
     const oldPassword = String(body.oldPassword ?? '')
     const newPassword = String(body.newPassword ?? '')
     const newPassword2 = String(body.newPassword2 ?? '')
     const user = users.find((u) => u.username === session.username)
     if (!user || !verifyPassword(oldPassword, user.passwordHash)) {
-      const remaining = limiter.recordFailure(ip, session.username)
+      const remaining = limiter.recordFailure(ip, session.username.toLowerCase())
       log(`改密失败 ip=${clean(ip)} user=${clean(session.username)} 原因=当前密码错误 剩余=${remaining}`)
       return sendJson(res, 401, { error: '当前密码不正确' })
     }
     if (newPassword.length < 8) return sendJson(res, 400, { error: '新密码长度至少 8 位' })
     if (newPassword.length > 1024) return sendJson(res, 400, { error: '新密码过长' })
+    const weakReason = checkNewPassword(newPassword)
+    if (weakReason) {
+      log(`改密拒绝 user=${clean(session.username)} 原因=弱口令`)
+      return sendJson(res, 400, { error: weakReason })
+    }
     if (newPassword !== newPassword2) return sendJson(res, 400, { error: '两次输入的新密码不一致' })
     if (newPassword === oldPassword) return sendJson(res, 400, { error: '新密码不能与当前密码相同' })
     user.passwordHash = hashPassword(newPassword)
@@ -317,7 +369,8 @@ export function apply(ctx, config = {}) {
     const url = new URL(req.url ?? '/', 'http://local')
     const pathname = url.pathname
     const cookies = parseCookies(req.headers.cookie)
-    const session = sessions.get(cookies[COOKIE_NAME])
+    const sessionBindKey = cfg.bindUserAgent ? uaBindKey(req.headers['user-agent']) : undefined
+    const session = sessions.get(cookies[COOKIE_NAME], sessionBindKey)
 
     if (!initialized) {
       if (pathname === '/setup') {
@@ -351,14 +404,14 @@ export function apply(ctx, config = {}) {
       return
     }
     if (!session) {
-      // 浏览器自动请求的纯静态元数据（manifest/favicon/robots.txt，无敏感信息）：
-      // 仅放行幂等的 GET/HEAD，其余方法一律拒绝
+      // 浏览器自动请求的静态元数据：未登录时由门卫自产空响应——
+      // 不反代真 dsh 资源（manifest/favicon 含 "DeepSeek Harness" 指纹，会被针对性扫描利用）；
+      // robots.txt 明确 Disallow 防搜索引擎收录登录页。仅放行幂等的 GET/HEAD。
       if ((req.method === 'GET' || req.method === 'HEAD') && AUTO_RESOURCE_PATHS.has(pathname)) {
-        return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs, {
-          clientLoopbackTrust: cfg.clientLoopbackTrust,
-          settingsDownload: cfg.settingsFileDownload && !nativeOpenAvailable(),
-          trustProxy: cfg.trustProxy,
-        })
+        if (pathname === '/robots.txt') return sendText(res, 200, 'User-agent: *\nDisallow: /\n')
+        res.writeHead(204)
+        res.end()
+        return
       }
       if (pathname === '/') return sendHtml(res, 200, loginPageHtml)
       return sendJson(res, 401, { error: '未登录，请先访问 / 登录' })
@@ -387,22 +440,37 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  const server = http.createServer((req, res) => {
-    handle(req, res).catch((err) => {
-      log(`请求处理出错：${err?.message ?? err}`)
-      if (!res.headersSent) {
-        sendSecurityHeaders(res)
-        res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
-        res.end('内部错误')
-      } else {
-        res.destroy()
-      }
-    })
-  })
+  // 门卫自身 TLS（可选）：启用时 https 承载同一 handler，WS 升级路径不变
+  const server = tlsCfg
+    ? https.createServer({ cert: tlsCfg.cert, key: tlsCfg.key }, (req, res) => {
+        handle(req, res).catch((err) => {
+          log(`请求处理出错：${err?.message ?? err}`)
+          if (!res.headersSent) {
+            sendSecurityHeaders(res)
+            res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('内部错误')
+          } else {
+            res.destroy()
+          }
+        })
+      })
+    : http.createServer((req, res) => {
+        handle(req, res).catch((err) => {
+          log(`请求处理出错：${err?.message ?? err}`)
+          if (!res.headersSent) {
+            sendSecurityHeaders(res)
+            res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('内部错误')
+          } else {
+            res.destroy()
+          }
+        })
+      })
 
-  // WebSocket 升级：先校验会话，通过后才转发给 dsh
+  // WebSocket 升级：先校验会话（含 UA 绑定），通过后才转发给 dsh
   server.on('upgrade', (req, socket, head) => {
-    const session = sessions.get(parseCookies(req.headers.cookie)[COOKIE_NAME])
+    const bindKey = cfg.bindUserAgent ? uaBindKey(req.headers['user-agent']) : undefined
+    const session = sessions.get(parseCookies(req.headers.cookie)[COOKIE_NAME], bindKey)
     if (!initialized || !session) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src \'self\'; style-src \'unsafe-inline\'; script-src \'unsafe-inline\'\r\nConnection: close\r\n\r\n')
       socket.destroy()
@@ -426,7 +494,8 @@ export function apply(ctx, config = {}) {
   server.listen(cfg.listenPort, cfg.listenHost, () => {
     const addr = server.address()
     const shown = typeof addr === 'object' && addr ? addr.port : cfg.listenPort
-    log(`外部入口已启动：http://${cfg.listenHost}:${shown}（反代至 http://${cfg.targetHost}:${cfg.targetPort}）`)
+    const scheme = tlsCfg ? 'https' : 'http'
+    log(`外部入口已启动：${scheme}://${cfg.listenHost}:${shown}（反代至 http://${cfg.targetHost}:${cfg.targetPort}）`)
   })
 
   const sweepTimer = setInterval(() => {

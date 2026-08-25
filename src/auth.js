@@ -3,7 +3,12 @@
  * 零外部依赖，全部使用 node:crypto 内置实现（scrypt）。
  */
 
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+
+/** 会话绑定的客户端指纹键：UA 的短哈希；无 UA 头时为固定值（保持一致性即可）。 */
+export function uaBindKey(userAgent) {
+  return createHash('sha256').update(String(userAgent ?? '')).digest('hex').slice(0, 16)
+}
 
 /**
  * 密码哈希格式：scrypt$N$r$p$saltB64$hashB64
@@ -35,6 +40,33 @@ export function verifyPassword(password, stored) {
   }
 }
 
+/**
+ * 全局认证计算节流：滑动窗口内限制「触发 scrypt 计算的请求数」。
+ * 目的：即使攻击者轮换 IP+用户名绕开双维度锁定，也无法把门卫 CPU 打满
+ * （每次 scrypt 约 20~100ms，超限直接 429，不消耗哈希计算）。
+ */
+export class GlobalAuthThrottle {
+  constructor(maxPerWindow = 30, windowMs = 60_000) {
+    this.maxPerWindow = Math.max(1, Number(maxPerWindow) || 30)
+    this.windowMs = Math.max(1000, Number(windowMs) || 60_000)
+    this.count = 0
+    this.windowStart = 0
+  }
+
+  /**
+   * 尝试占一个配额。返回 true=放行（计入窗口）；false=超限（不计入，不消耗计算）。
+   */
+  acquire(now = Date.now()) {
+    if (now - this.windowStart >= this.windowMs) {
+      this.windowStart = now
+      this.count = 0
+    }
+    if (this.count >= this.maxPerWindow) return false
+    this.count += 1
+    return true
+  }
+}
+
 // 预计算的哑哈希：用户名不存在时也执行一次等价 scrypt 计算，
 // 抹平「账号存在与否」的响应时序差，防止用户名枚举。
 const DUMMY_HASH = hashPassword('dsh-login-gateway-dummy-verify')
@@ -46,6 +78,33 @@ export function fakeVerify(password) {
   } catch {
     /* 忽略 */
   }
+}
+
+/**
+ * 弱口令黑名单：setup 与改密的新密码一律拒绝这些最常被爆破字典收录的模式。
+ * 只拦「明显可猜」的，不做复杂度强制（避免可用性损失），配合限速已足够。
+ */
+const WEAK_PASSWORDS = new Set([
+  '12345678', '123456789', '1234567890', '12345678a', '12341234', '11223344',
+  '87654321', '0123456789', '123456780', '147258369', '159357888',
+  'password', 'password1', 'password123',
+  'passw0rd', 'p@ssw0rd', 'p@ssword',
+  'qwerty123', 'qwertyuiop', 'qweasdzxc', '1qaz2wsx', '1q2w3e4r',
+  'abcd1234', 'abc12345', 'a1234567', 'aa123456', 'asd12345',
+  'iloveyou', 'sunshine', 'princess', 'football', 'baseball',
+  'letmein123', 'welcome1', 'monkey123', 'admin123', 'root1234',
+])
+
+/**
+ * 新密码强度检查：返回 null=通过；字符串=拒绝原因。
+ * 规则：≥8 位（调用方已查）、非黑名单、非纯数字、非单一字符重复。
+ */
+export function checkNewPassword(password) {
+  const p = String(password ?? '')
+  if (WEAK_PASSWORDS.has(p.toLowerCase())) return '密码过于常见，容易被字典爆破，请更换'
+  if (/^\d{8,}$/.test(p)) return '密码不能是纯数字'
+  if (/^(.)\1{7,}$/u.test(p)) return '密码不能由同一字符重复组成'
+  return null
 }
 
 /**
@@ -63,8 +122,11 @@ export function safeEqualStr(a, b) {
 }
 
 /**
- * 会话存储：内存 Map，token -> { username, expiresAt }。
- * maxSessions 上限防止已认证方反复登录把内存刷爆（逐出最旧会话）。
+ * 会话存储：内存 Map，token -> { username, expiresAt, bindKey }。
+ * - maxSessions 上限防止已认证方反复登录把内存刷爆（逐出最旧会话）。
+ * - bindKey：客户端绑定键（默认 User-Agent 哈希）。纯 HTTP 直连场景下 Cookie
+ *   若被嗅探，攻击者换个客户端 UA 也无法复用；浏览器升级导致的 UA 变化
+ *   只需重新登录一次。
  */
 export class SessionStore {
   constructor(ttlMs, maxSessions = 1000) {
@@ -73,23 +135,28 @@ export class SessionStore {
     this.sessions = new Map()
   }
 
-  create(username) {
+  create(username, bindKey = null) {
     if (this.sessions.size >= this.maxSessions) {
       // Map 保持插入序：TTL 相同 ⇒ 最先插入即最先过期，逐出最旧
       const oldest = this.sessions.keys().next().value
       if (oldest !== undefined) this.sessions.delete(oldest)
     }
     const token = randomBytes(32).toString('hex')
-    this.sessions.set(token, { username, expiresAt: Date.now() + this.ttlMs })
+    this.sessions.set(token, { username, expiresAt: Date.now() + this.ttlMs, bindKey })
     return token
   }
 
-  /** 返回会话对象，不存在或过期返回 null。 */
-  get(token) {
+  /** 返回会话对象；不存在/过期/绑定键不符（返回 null 并吊销该 token）均不可用。 */
+  get(token, bindKey) {
     if (!token) return null
     const s = this.sessions.get(token)
     if (!s) return null
     if (s.expiresAt < Date.now()) {
+      this.sessions.delete(token)
+      return null
+    }
+    if (bindKey !== undefined && s.bindKey !== null && s.bindKey !== undefined && s.bindKey !== bindKey) {
+      // 绑定键不匹配：判定为令牌被异端复用，立即吊销
       this.sessions.delete(token)
       return null
     }

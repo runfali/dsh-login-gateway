@@ -5,7 +5,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { hashPassword, verifyPassword, fakeVerify, safeEqualStr, SessionStore, LoginLimiter } from '../src/auth.js'
+import { hashPassword, verifyPassword, fakeVerify, safeEqualStr, checkNewPassword, GlobalAuthThrottle, SessionStore, LoginLimiter } from '../src/auth.js'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -101,6 +101,24 @@ test('LoginLimiter sweep 清理过期未锁定记录与已到期锁', async () =
 
 test('fakeVerify 消耗等价时间且不抛错（反枚举哑校验）', () => {
   assert.doesNotThrow(() => fakeVerify('anything'))
+})
+
+test('GlobalAuthThrottle 窗口计数与重置', () => {
+  const t = new GlobalAuthThrottle(3, 60_000)
+  assert.equal(t.acquire(1000), true)
+  assert.equal(t.acquire(1000), true)
+  assert.equal(t.acquire(1000), true)
+  assert.equal(t.acquire(1000), false) // 满
+  assert.equal(t.acquire(61_000), true) // 新窗口重置
+})
+
+test('checkNewPassword 拦截黑名单/纯数字/重复字符，放行正常密码', () => {
+  assert.match(checkNewPassword('password123'), /常见/)
+  assert.match(checkNewPassword('12345678'), /常见|纯数字/) // 同时命中黑名单与纯数字，任一拒绝即可
+  assert.match(checkNewPassword('98765432'), /纯数字/)
+  assert.match(checkNewPassword('aaaaaaaa'), /重复/)
+  assert.equal(checkNewPassword('Str0ng!Pass9'), null)
+  assert.equal(checkNewPassword('正确的中文密码九个字'), null)
 })
 
 test('safeEqualStr 恒定时间语义：相等/不等/长度不同/非字符串', () => {

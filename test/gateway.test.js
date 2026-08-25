@@ -159,17 +159,18 @@ test('HTML 响应被注入退出按钮脚本', async () => {
   }
 })
 
-test('未登录静态资源 GET 放行', async () => {
+test('未登录静态资源仅放行 GET/HEAD，POST 拒绝', async () => {
   const up = await startUpstream((req, res) => res.end('asset'))
   const gw = await startGateway({ targetPort: up.port })
   try {
     const get = await request(gw.port, 'GET', '/favicon.ico')
     assert.equal(get.status, 200)
+    const head = await request(gw.port, 'HEAD', '/favicon.ico')
+    assert.equal(head.status, 200)
+    const post = await request(gw.port, 'POST', '/favicon.ico', { body: 'x' })
+    assert.equal(post.status, 401)
     const other = await request(gw.port, 'GET', '/secret.txt')
     assert.equal(other.status, 401) // 白名单外路径不放行
-    // 现状记录：白名单路径未区分 HTTP method，POST 也被放行（待加固收紧为仅 GET/HEAD）
-    const post = await request(gw.port, 'POST', '/favicon.ico', { body: 'x' })
-    assert.equal(post.status, 200)
   } finally {
     gw.stop()
     await up.close()
@@ -272,7 +273,7 @@ test('WS 升级未登录被拒（401 后断开），登录后转发 101 并可�
       sock.on('close', () => finish({ kind: buf.includes('401') ? 'rejected-401-closed' : 'closed' }))
     })
 
-  const gw = await startGateway({ targetPort: up.address().port })
+  const gw = await startGateway({ targetPort: up.address().port }) // 裸 http.Server 无 .port 属性
   try {
     const denied = await wsRaw(gw.port, null)
     assert.ok(
@@ -367,4 +368,107 @@ test('用户文件损坏时启动报错不静默重置', async () => {
       }),
     /用户文件格式错误/,
   )
+})
+
+test('审计日志：登录成功/失败/锁定均留痕（IP+用户名，净化换行）', async () => {
+  const gw = await startGateway({}, false) // 未初始化：先 setup
+  try {
+    const line = gw.logs.find((l) => l.includes('一次性令牌'))
+    const token = line.match(/令牌：([A-Z0-9-]+)/)[1]
+    await request(gw.port, 'POST', '/setup', {
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, username: 'boss', password: 'password123', password2: 'password123' }),
+    })
+    // 失败一次（含日志注入尝试）
+    const evilUser = 'bo\nss2026-01-01 INJECTED'
+    await login(gw.port, evilUser, 'nope')
+    // 成功一次
+    await login(gw.port, 'boss', 'password123')
+    const joined = gw.logs.join('\n')
+    assert.ok(gw.logs.some((l) => l.startsWith('登录失败 ip=') && l.includes('user=')), '应有登录失败审计')
+    assert.ok(gw.logs.some((l) => l.startsWith('登录成功 ip=') && l.includes('user=boss')), '应有登录成功审计')
+    assert.ok(!joined.includes('INJECTED\n'), '换行必须被净化为空格') // 日志注入被抹平
+    assert.match(joined, /bo ss2026-01-01 INJECTED/) // 净化后单行内可见
+  } finally {
+    gw.stop()
+  }
+})
+
+test('trustProxy=true 时按 XFF 首段区分限速桶', async () => {
+  const gw = await startGateway({ trustProxy: true })
+  try {
+    for (let i = 0; i < 5; i++) {
+      await request(gw.port, 'POST', '/login', {
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.7' },
+        body: JSON.stringify({ username: 'admin', password: 'wrong' }),
+      })
+    }
+    // 203.0.113.7 的 IP 桶已锁（IP 维度文案）；同时 admin 用户名维度也已累计 5 次
+    // 失败触发用户名锁——换新 IP 后收到的是用户名锁定文案，证明两维度独立生效
+    const locked = await request(gw.port, 'POST', '/login', {
+      headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.7' },
+      body: JSON.stringify({ username: 'admin', password: 'password123' }),
+    })
+    assert.equal(locked.status, 401)
+    assert.match(JSON.parse(locked.body).error, /失败次数过多/) // 该 XFF 自己的桶已锁
+    const fresh = await request(gw.port, 'POST', '/login', {
+      headers: { 'content-type': 'application/json', 'x-forwarded-for': '198.51.100.9' },
+      body: JSON.stringify({ username: 'admin', password: 'wrong' }),
+    })
+    assert.equal(fresh.status, 401)
+    // 新 IP 桶未被旧 IP 连累，但撞上用户名维度的跨 IP 锁（防分布式爆破）
+    assert.match(JSON.parse(fresh.body).error, /账号已被临时锁定/)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('trustProxy=false 时 XFF 不参与限速且不透传上游', async () => {
+  let seenHeaders = null
+  const up = await startUpstream((req, res) => {
+    seenHeaders = req.headers
+    res.end('ok')
+  })
+  const gw = await startGateway({ trustProxy: false, targetPort: up.port })
+  try {
+    const cookie = cookieOf(await login(gw.port))
+    await request(gw.port, 'GET', '/api/x', {
+      headers: { cookie, 'x-forwarded-for': '1.2.3.4', 'x-real-ip': '1.2.3.4' },
+    })
+    assert.equal(seenHeaders['x-forwarded-for'], undefined)
+    assert.equal(seenHeaders['x-real-ip'], undefined)
+  } finally {
+    gw.stop()
+    await up.close()
+  }
+})
+
+test('secureCookie=true 时会话 Cookie 带 Secure 标记', async () => {
+  const gw = await startGateway({ secureCookie: true })
+  try {
+    const ok = await login(gw.port)
+    assert.match(ok.headers['set-cookie'][0], /Secure/)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('maxSessions 上限逐出最旧会话', async () => {
+  const up = await startUpstream((req, res) => res.end('still-valid'))
+  const gw = await startGateway({ maxSessions: 3, targetPort: up.port })
+  try {
+    const c1 = cookieOf(await login(gw.port))
+    cookieOf(await login(gw.port))
+    cookieOf(await login(gw.port))
+    const c4 = cookieOf(await login(gw.port)) // 容量满，逐出 c1
+    const gone = await request(gw.port, 'GET', '/api/session-check', { headers: { cookie: c1 } })
+    assert.equal(gone.status, 401) // 最旧会话已被逐出
+    const alive = await request(gw.port, 'GET', '/api/session-check', {
+      headers: { cookie: c4 },
+    })
+    assert.equal(alive.status, 200) // 新会话仍有效（经 mock 上游隔离验证）
+  } finally {
+    gw.stop()
+    await up.close()
+  }
 })

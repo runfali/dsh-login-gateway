@@ -16,7 +16,7 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { hashPassword, LoginLimiter, SessionStore, verifyPassword } from './auth.js'
+import { hashPassword, fakeVerify, LoginLimiter, safeEqualStr, SessionStore, verifyPassword } from './auth.js'
 import { nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
 import { defaultSettingsFilePath, settingsFilePayload } from './settings-file.js'
 import { loadUsersSync, saveUsersSync } from './user-store.js'
@@ -148,16 +148,45 @@ export function apply(ctx, config = {}) {
     clientLoopbackTrust: config.clientLoopbackTrust ?? true,
     settingsFilePath: config.settingsFilePath ?? defaultSettingsFilePath(),
     settingsFileDownload: config.settingsFileDownload ?? true,
+    // 前置 TLS 反代（nginx/caddy）场景设 true：从 X-Forwarded-For 取真实客户端 IP，
+    // 让限速按真实来源生效。直连场景必须保持 false，否则攻击者可伪造 XFF 绕过限速。
+    trustProxy: config.trustProxy ?? false,
+    // Cookie Secure 标记：仅经 HTTPS 访问门卫时开启（前置 TLS 反代场景）
+    secureCookie: config.secureCookie ?? false,
+    // 会话容量上限：防止反复登录刷爆内存
+    maxSessions: config.maxSessions ?? 1000,
   }
   // config.users 种子机制已废弃（会造成"默认用户"）：配置里仍有 users 字段时忽略，不报错。
   // 新装一律强制走 /setup 引导创建账号；本地无用户数据 = 未初始化。
   const log = getLog(ctx)
-  const sessions = new SessionStore(cfg.sessionTtlHours * 3600_000)
+  const sessions = new SessionStore(cfg.sessionTtlHours * 3600_000, cfg.maxSessions)
   const limiter = new LoginLimiter(cfg.maxLoginAttempts, cfg.lockMinutes * 60_000)
   const setupLimiter = new LoginLimiter(cfg.setupMaxAttempts, cfg.setupLockMinutes * 60_000)
   let users = null
   let initialized = false
   let setupToken = null
+
+  /** 客户端来源 IP：trustProxy 时取 XFF 首段（前置 TLS 反代场景），否则直连 socket 地址。 */
+  function getClientIp(req) {
+    if (cfg.trustProxy) {
+      const xff = req.headers['x-forwarded-for']
+      if (typeof xff === 'string' && xff.length > 0) {
+        const first = xff.split(',')[0].trim()
+        if (first) return first.slice(0, 128)
+      }
+    }
+    return req.socket.remoteAddress ?? 'unknown'
+  }
+
+  /** 日志字段净化：防换行/控制字符伪造审计日志条目（日志注入）。 */
+  const clean = (s) => String(s ?? '').replace(/[\r\n\t\x00-\x1f]+/g, ' ').slice(0, 64)
+
+  /** 会话 Cookie 值：secureCookie 开启时追加 Secure 标记。 */
+  function sessionCookie(value, maxAgeSeconds) {
+    const parts = [`${COOKIE_NAME}=${value}`, `Max-Age=${maxAgeSeconds}`, 'Path=/', 'HttpOnly', 'SameSite=Strict']
+    if (cfg.secureCookie) parts.push('Secure')
+    return parts.join('; ')
+  }
 
   // 用户加载：文件存在 → 已初始化；不存在 → 未初始化
   const fileUsers = loadUsersSync(cfg.userStorePath)
@@ -176,7 +205,7 @@ export function apply(ctx, config = {}) {
   }
 
   async function handleLogin(req, res) {
-    const ip = req.socket.remoteAddress ?? 'unknown'
+    const ip = getClientIp(req)
     if (limiter.isLocked(ip)) {
       return sendJson(res, 401, { error: `失败次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
     }
@@ -188,26 +217,36 @@ export function apply(ctx, config = {}) {
     const username = String(body.username ?? '').trim()
     const password = String(body.password ?? '')
     const preLock = limiter.lockedBy(ip, username)
-    if (preLock) return sendJson(res, 401, { error: lockMsg(preLock) })
+    if (preLock) {
+      log(`登录拒绝（已锁定） ip=${clean(ip)} user=${clean(username)}`)
+      return sendJson(res, 401, { error: lockMsg(preLock) })
+    }
     const user = users.find((u) => u.username === username)
     if (!user || !verifyPassword(password, user.passwordHash)) {
+      if (!user) fakeVerify(password) // 反枚举：不存在也消耗等价计算
       const remaining = limiter.recordFailure(ip, username)
       const lock = limiter.lockedBy(ip, username)
-      if (lock) return sendJson(res, 401, { error: lockMsg(lock) })
+      if (lock) {
+        log(`登录失败并触发锁定 ip=${clean(ip)} user=${clean(username)}`)
+        return sendJson(res, 401, { error: lockMsg(lock) })
+      }
+      log(`登录失败 ip=${clean(ip)} user=${clean(username)} 剩余=${remaining}`)
       return sendJson(res, 401, { error: `用户名或密码错误，剩余可尝试次数：${remaining}` })
     }
     limiter.reset(ip, username)
     const token = sessions.create(user.username)
-    res.setHeader('Set-Cookie', `${COOKIE_NAME}=${token}; Max-Age=${cfg.sessionTtlHours * 3600}; Path=/; HttpOnly; SameSite=Strict`)
+    res.setHeader('Set-Cookie', sessionCookie(token, cfg.sessionTtlHours * 3600))
+    log(`登录成功 ip=${clean(ip)} user=${clean(username)}`)
     return sendJson(res, 200, { ok: true })
   }
 
   async function handleSetup(req, res) {
-    const ip = req.socket.remoteAddress ?? 'unknown'
+    const ip = getClientIp(req)
     if (setupLimiter.isLocked(ip)) {
       return sendJson(res, 429, { error: `尝试次数过多，已锁定 ${cfg.setupLockMinutes} 分钟，请稍后再试` })
     }
     const fail = (msg) => {
+      log(`初始化失败 ip=${clean(ip)} 原因=${clean(msg)}`)
       const remaining = setupLimiter.recordFailure(ip)
       if (setupLimiter.isLocked(ip)) {
         return sendJson(res, 429, { error: `尝试次数过多，已锁定 ${cfg.setupLockMinutes} 分钟，请稍后再试` })
@@ -220,7 +259,7 @@ export function apply(ctx, config = {}) {
     const username = String(body.username ?? '').trim()
     const password = String(body.password ?? '')
     const password2 = String(body.password2 ?? '')
-    if (token !== setupToken) return fail('一次性令牌不正确')
+    if (!safeEqualStr(token, setupToken)) return fail('一次性令牌不正确')
     if (!username) return fail('用户名不能为空')
     if (username.length > 64) return fail('用户名长度不能超过 64 个字符')
     if (password.length < 8) return fail('密码长度至少 8 位')
@@ -241,7 +280,6 @@ export function apply(ctx, config = {}) {
     const cookies = parseCookies(req.headers.cookie)
     const session = sessions.get(cookies[COOKIE_NAME])
 
-    // 未初始化：/ 302 跳转 /setup 引导注册，其余路径引导到初始化
     if (!initialized) {
       if (pathname === '/setup') {
         if (req.method === 'GET') return sendHtml(res, 200, setupPageHtml)
@@ -264,24 +302,26 @@ export function apply(ctx, config = {}) {
     }
     if (pathname === '/logout') {
       if (req.method !== 'POST') return sendText(res, 405, '仅支持 POST')
+      const username = session ? clean(session.username) : ''
       sessions.delete(cookies[COOKIE_NAME])
-      res.setHeader('Set-Cookie', `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`)
+      res.setHeader('Set-Cookie', sessionCookie('', 0))
+      log(`登出 user=${username}`)
       sendSecurityHeaders(res)
       res.writeHead(302, { Location: '/' })
       res.end()
       return
     }
 
-    // 浏览器自动请求的纯静态元数据（manifest/favicon/robots.txt，无敏感信息）：
-    // 未登录也直接放行反代——否则标签页无图标、PWA 不可安装（请求不带 Cookie 属正常）
-    if (!session && AUTO_RESOURCE_PATHS.has(pathname)) {
-      return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs, {
-        clientLoopbackTrust: cfg.clientLoopbackTrust,
-        settingsDownload: cfg.settingsFileDownload && !nativeOpenAvailable(),
-      })
-    }
-
     if (!session) {
+      // 浏览器自动请求的纯静态元数据（manifest/favicon/robots.txt，无敏感信息）：
+      // 仅放行幂等的 GET/HEAD，其余方法一律拒绝
+      if ((req.method === 'GET' || req.method === 'HEAD') && AUTO_RESOURCE_PATHS.has(pathname)) {
+        return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs, {
+          clientLoopbackTrust: cfg.clientLoopbackTrust,
+          settingsDownload: cfg.settingsFileDownload && !nativeOpenAvailable(),
+          trustProxy: cfg.trustProxy,
+        })
+      }
       if (pathname === '/') return sendHtml(res, 200, loginPageHtml)
       return sendJson(res, 401, { error: '未登录，请先访问 / 登录' })
     }
@@ -301,6 +341,7 @@ export function apply(ctx, config = {}) {
     return proxyRequest(req, res, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, cfg.streamIdleTimeoutMs, {
       clientLoopbackTrust: cfg.clientLoopbackTrust,
       settingsDownload: cfg.settingsFileDownload && !nativeOpenAvailable(),
+      trustProxy: cfg.trustProxy,
     })
   }
 
@@ -325,7 +366,7 @@ export function apply(ctx, config = {}) {
       socket.destroy()
       return
     }
-    proxyUpgrade(req, socket, head, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs)
+    proxyUpgrade(req, socket, head, cfg.targetHost, cfg.targetPort, cfg.proxyTimeoutMs, { trustProxy: cfg.trustProxy })
   })
 
   // 并发上限 + 收紧超时防 slowloris（Node 默认 headersTimeout 60s 过长）：
@@ -336,11 +377,14 @@ export function apply(ctx, config = {}) {
   server.requestTimeout = 30_000
   server.keepAliveTimeout = 5_000
 
-  server.once('error', (err) => {
-    log(`外部入口启动失败：${err?.message ?? err}`)
+  // 持续监听错误（端口占用、运行期 accept 异常等），避免未捕获事件
+  server.on('error', (err) => {
+    log(`外部入口错误：${err?.message ?? err}`)
   })
   server.listen(cfg.listenPort, cfg.listenHost, () => {
-    log(`外部入口已启动：http://${cfg.listenHost}:${cfg.listenPort}（反代至 http://${cfg.targetHost}:${cfg.targetPort}）`)
+    const addr = server.address()
+    const shown = typeof addr === 'object' && addr ? addr.port : cfg.listenPort
+    log(`外部入口已启动：http://${cfg.listenHost}:${shown}（反代至 http://${cfg.targetHost}:${cfg.targetPort}）`)
   })
 
   const sweepTimer = setInterval(() => {
@@ -353,5 +397,8 @@ export function apply(ctx, config = {}) {
   ctx?.effect?.(() => () => {
     clearInterval(sweepTimer)
     server.close()
+    // 立即回收全部存活连接（SSE/WS 长连接不阻塞插件停用）
+    server.closeIdleConnections?.()
+    server.closeAllConnections?.()
   })
 }

@@ -404,11 +404,19 @@ export function apply(ctx, config = {}) {
       return
     }
     if (!session) {
-      // 浏览器自动请求的静态元数据：未登录时由门卫自产空响应——
-      // 不反代真 dsh 资源（manifest/favicon 含 "DeepSeek Harness" 指纹，会被针对性扫描利用）；
-      // robots.txt 明确 Disallow 防搜索引擎收录登录页。仅放行幂等的 GET/HEAD。
+      // 浏览器自动请求的静态元数据：未登录时由门卫自产——
+      // 不反代真 dsh 资源（manifest/favicon 含 "DeepSeek Harness" 指纹，会被针对性扫描利用）。
+      // manifest 必须返回合法 JSON（空响应会让浏览器报 "Manifest: Syntax error"），
+      // 用极简中性内容占位；robots.txt 明确 Disallow 防搜索引擎收录登录页。
+      // 仅放行幂等的 GET/HEAD，其余方法一律拒绝。
       if ((req.method === 'GET' || req.method === 'HEAD') && AUTO_RESOURCE_PATHS.has(pathname)) {
         if (pathname === '/robots.txt') return sendText(res, 200, 'User-agent: *\nDisallow: /\n')
+        if (pathname === '/manifest.webmanifest') {
+          sendSecurityHeaders(res)
+          res.writeHead(200, { 'content-type': 'application/manifest+json; charset=utf-8' })
+          res.end('{"name":"Service","short_name":"Service","start_url":"/","scope":"/","display":"standalone","icons":[]}')
+          return
+        }
         res.writeHead(204)
         res.end()
         return

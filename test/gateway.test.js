@@ -159,17 +159,23 @@ test('HTML 响应被注入退出按钮脚本', async () => {
   }
 })
 
-test('未登录静态资源由门卫自产空响应（去指纹），仅 GET/HEAD', async () => {
+test('未登录静态资源由门卫自产（去指纹），仅 GET/HEAD', async () => {
   const up = await startUpstream((req, res) => res.end('asset'))
   const gw = await startGateway({ targetPort: up.port })
   try {
     const get = await request(gw.port, 'GET', '/favicon.ico')
     assert.equal(get.status, 204)
     assert.equal(get.body, '') // 不反代真 dsh 资源（防 "DeepSeek Harness" 指纹泄露）
-    const head = await request(gw.port, 'HEAD', '/manifest.webmanifest')
-    assert.equal(head.status, 204)
+    // manifest 必须是合法 JSON 且不含品牌字样（空响应会触发浏览器 Manifest Syntax error）
+    const manifest = await request(gw.port, 'GET', '/manifest.webmanifest')
+    assert.equal(manifest.status, 200)
+    assert.match(manifest.headers['content-type'], /manifest\+json/)
+    const parsed = JSON.parse(manifest.body)
+    assert.equal(parsed.name, 'Service')
+    assert.ok(!manifest.body.includes('DeepSeek'))
+    const head = await request(gw.port, 'HEAD', '/robots.txt')
+    assert.equal(head.status, 200)
     const robots = await request(gw.port, 'GET', '/robots.txt')
-    assert.equal(robots.status, 200)
     assert.match(robots.body, /Disallow: \//) // 防搜索引擎收录
     const post = await request(gw.port, 'POST', '/favicon.ico', { body: 'x' })
     assert.equal(post.status, 401)

@@ -27,7 +27,17 @@ DeepSeek Harness（dsh）的**登录门卫插件**。dsh 的 Web UI 默认只监
                     127.0.0.1:3080（dsh Web UI，信任围栏放行，特权 API 全可用）
 ```
 
-关键点：反代时把请求头里的 `Host`/`Origin`/`Sec-Fetch-Site` 改写为 loopback 形态，让 dsh 把请求当作“本机请求”信任放行；WebSocket 升级请求同样先校验会话再转发。
+关键点：反代时把请求头里的 `Host`/`Origin`/`Sec-Fetch-Site` 改写为 loopback 形态，让 dsh 把请求当作"本机请求"信任放行；WebSocket 升级请求同样先校验会话再转发。
+
+**dsh 0.1.2-alpha.1 起 dsh 在信任围栏之外又加了一层「浏览器鉴权」**：首页与全部 `/api`（含 WS 升级）必须携带宿主签发的 `dsh-auth-*` 会话 Cookie，而该 Cookie 只能由启动令牌（打印在服务器终端的 `dsh web: …/?token=…` URL 里）换取。浏览器只见过门卫地址，永远拿不到这个令牌——所以由门卫在「已登录用户的首页导航」上代跑一次令牌交换：
+
+- 令牌只出现在**门卫 → dsh** 这一跳的请求行上，不进入任何下发给浏览器的内容；
+- dsh 回 `303 + Set-Cookie`，门卫原样透传，浏览器保存后 `/api` 与 WS 自然带上；
+- Cookie 名按 `dsh-auth-` + `base64url(sha256(authority))` 反推（authority 即门卫改写后的 `Host`），据此判断是否需要交换，避免每次导航都重复走 303；
+- 自愈：浏览器带着已失效的 `dsh-auth-*`（密钥轮换、过期残留）时，门卫收到宿主的 401 会剥掉坏 Cookie 重跑一次交换，远端用户不必手动清 Cookie；
+- 登出门卫时一并吊销该 Cookie（属性与 dsh 签发的那份逐字对齐，否则浏览器删不掉）。
+
+对 dsh ≤ 0.1.1 的宿主，`connection` 服务没有 `authenticatedUrl`，上述逻辑整体跳过，行为与旧版一致。
 
 ## 快速开始（首次安装）
 
@@ -229,8 +239,18 @@ rm -rf ~/.dsh-login-gateway/
 - 认证：`node:crypto` scrypt（`scrypt$N$r$p$salt$hash` 自描述格式），恒定时间比较防时序攻击；登录时账号不存在也执行等价计算防用户名枚举。
 - 会话：内存 `Map` + 过期清理（30 分钟定时 sweep）+ 容量上限（逐出最旧）。
 - 反代：流式透传（SSE 长连接友好），剔除 hop-by-hop 头、化解 CL+TE 歧义请求，WebSocket 升级用后端 `rawHeaders` 原样构造 `101` 响应。
+- 宿主浏览器鉴权适配（dsh ≥ 0.1.2-alpha.1）：`src/index.js` 经宿主公开的 `connection.authenticatedUrl()` 取本进程启动令牌，`src/proxy.js` 在首页导航上代跑令牌交换并处理 401 自愈；门卫与 dsh 同进程，不读任何宿主内部字段。
 - 兼容性补丁：经门卫访问时，用随包自带的**浏览器端 client bundle**（`lib/client.js`）把 dsh 连接标记为 loopback，恢复设置持久化（同时解决「设置-模型」「设置-插件-插件配置」显示问题），不改 dsh 源码；无桌面环境时把「打开配置文件」改为门卫下载。
 - 零运行时依赖，所有依赖仅存在于开发/测试环境。
+
+## 版本兼容
+
+| dsh | 状态 |
+| --- | --- |
+| `0.1.0-rc.*` / `0.1.1-rc.*` | ✅ 正常工作（无宿主浏览器鉴权，适配逻辑整体跳过） |
+| `0.1.2-alpha.1` 及以上 | ✅ 需要本仓库 ≥ 0.3.0；0.2.0 及更早版本登录后首页与全部 `/api` 一律 401 |
+
+升级 dsh 后无需改动门卫配置：令牌交换由门卫自动完成，浏览器首次访问首页时静默换取宿主会话。
 
 ## 测试
 
@@ -238,7 +258,7 @@ rm -rf ~/.dsh-login-gateway/
 npm test   # node --test test/（零依赖，node:test 内置框架）
 ```
 
-覆盖：密码哈希与篡改检测、会话过期/容量上限、限速锁定/双维度/TTL、请求头改写与走私防护、注入点边界安全、认证闸门、反代透传、WS 升级握手、setup 引导全流程、改密与会话吊销、审计日志与日志注入净化。
+覆盖：密码哈希与篡改检测、会话过期/容量上限、限速锁定/双维度/TTL、请求头改写与走私防护、注入点边界安全、认证闸门、反代透传、WS 升级握手、setup 引导全流程、改密与会话吊销、审计日志与日志注入净化；以及宿主浏览器鉴权适配（Cookie 名反推对真实抓包向量、令牌交换、失效 Cookie 自愈、令牌不下发浏览器、非首页路径不掺令牌、登出连带吊销宿主会话、旧版宿主行为不变）。
 
 ## 目录结构
 
@@ -246,7 +266,7 @@ npm test   # node --test test/（零依赖，node:test 内置框架）
 src/
   index.js        插件主入口：配置校验、路由分发、setup 引导、改密、审计日志、HTTP 服务 + WS 升级
   auth.js         密码哈希（scrypt）、会话存储（容量上限）、登录限速（双维度+TTL）、恒定时间比较
-  proxy.js        HTTP 反代（头改写 + hop-by-hop 剔除 + 走私防护）与 WebSocket 升级转发
+  proxy.js        HTTP 反代（头改写 + hop-by-hop 剔除 + 走私防护）、宿主浏览器鉴权交换、WebSocket 升级转发
   user-store.js   用户文件存储（JSON + 原子写入）
   settings-file.js dsh 设置文件下载辅助（无桌面环境兜底）
   login-page.js   登录页 HTML（深色主题，单文件内联）
@@ -261,4 +281,5 @@ test/
   auth.test.js    认证核心单测
   proxy.test.js   反代头处理单测
   gateway.test.js 端到端集成测试（认证闸门/反代/setup/WS/改密/审计）
+  browser-auth.test.js 宿主浏览器鉴权适配（假 dsh 上游复刻 BrowserAuth 语义）
 ```

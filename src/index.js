@@ -18,7 +18,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { dirname } from 'node:path'
 
 import { checkNewPassword, fakeVerify, GlobalAuthThrottle, hashPassword, LoginLimiter, safeEqualStr, SessionStore, uaBindKey, verifyPassword } from './auth.js'
-import { nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
+import { dshAuthCookieName, nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
 import { defaultSettingsFilePath, settingsFilePayload } from './settings-file.js'
 import { loadUsersSync, saveUsersSync } from './user-store.js'
 import { loginPageHtml } from './login-page.js'
@@ -150,6 +150,36 @@ function normalizeTlsConfig(raw) {
   return { cert, key }
 }
 
+/**
+ * 解析宿主 dsh 的浏览器鉴权参数（0.1.2-alpha.1 起首页与 /api 强制浏览器会话）。
+ *
+ * 启动令牌由宿主的 connection 服务给出——authenticatedUrl 是它公开声明的
+ * 「初始登录 URL」接口，门卫与宿主同进程，取用属正当路径，不碰任何内部字段。
+ * 旧版宿主（≤0.1.1）没有这个方法，返回 null 让反代退回原行为，保持向后兼容。
+ *
+ * @param {any} ctx cordis 上下文
+ * @param {{ targetHost: string, targetPort: number }} cfg
+ * @returns {{ cookieName: string, token: string } | null}
+ */
+function resolveDshAuth(ctx, cfg) {
+  let conn
+  try {
+    conn = typeof ctx?.get === 'function' ? ctx.get('connection') : null
+  } catch {
+    return null // 服务尚未挂载：本次不启用，留给下次请求重试
+  }
+  if (typeof conn?.authenticatedUrl !== 'function') return null
+  try {
+    // authority 必须与门卫改写后的 Host 逐字一致（宿主按 Host 反查 Cookie 名与签名受众）
+    const authority = new URL(`http://${cfg.targetHost}:${cfg.targetPort}`).host
+    const token = new URL(conn.authenticatedUrl(`http://${authority}`)).searchParams.get('token')
+    if (!token) return null
+    return { cookieName: dshAuthCookieName(authority), token }
+  } catch {
+    return null
+  }
+}
+
 export function apply(ctx, config = {}) {
   const cfg = {
     listenHost: config.listenHost ?? '0.0.0.0',
@@ -188,6 +218,10 @@ export function apply(ctx, config = {}) {
   // config.users 种子机制已废弃（会造成"默认用户"）：配置里仍有 users 字段时忽略，不报错。
   // 新装一律强制走 /setup 引导创建账号；本地无用户数据 = 未初始化。
   const log = getLog(ctx)
+  // 宿主浏览器鉴权参数惰性解析：connection 服务可能晚于本插件挂载，首次取不到
+  // 则下次请求再试；一旦取到即缓存（启动令牌与门卫同属一个 dsh 进程，进程内不变）。
+  let dshAuthCache
+  const getDshAuth = () => (dshAuthCache === undefined ? (dshAuthCache = resolveDshAuth(ctx, cfg)) : dshAuthCache)
   const sessions = new SessionStore(cfg.sessionTtlHours * 3600_000, cfg.maxSessions)
   const limiter = new LoginLimiter(cfg.maxLoginAttempts, cfg.lockMinutes * 60_000)
   const setupLimiter = new LoginLimiter(cfg.setupMaxAttempts, cfg.setupLockMinutes * 60_000)
@@ -216,6 +250,15 @@ export function apply(ctx, config = {}) {
     const parts = [`${COOKIE_NAME}=${value}`, `Max-Age=${maxAgeSeconds}`, 'Path=/', 'HttpOnly', 'SameSite=Strict']
     if (cfg.secureCookie) parts.push('Secure')
     return parts.join('; ')
+  }
+
+  /**
+   * 吊销宿主会话 Cookie。属性必须与 dsh 自己签发的那份逐字对齐（它不带 Secure），
+   * 否则浏览器按 (name, domain, path) 之外的 Secure 维度视为不同 Cookie，删不掉。
+   */
+  function expireDshCookie() {
+    const name = getDshAuth()?.cookieName
+    return name ? `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict` : null
   }
 
   /** secureCookie（即 HTTPS 部署）时对门卫自产响应补 HSTS。 */
@@ -396,7 +439,12 @@ export function apply(ctx, config = {}) {
       if (req.method !== 'POST') return sendText(res, 405, '仅支持 POST')
       const username = session ? clean(session.username) : ''
       sessions.delete(cookies[COOKIE_NAME])
-      res.setHeader('Set-Cookie', sessionCookie('', 0))
+      // 一并吊销宿主的浏览器会话 Cookie：共享浏览器上，下一个人登录门卫后
+      // 不该继承上一个人已经换到的 dsh 会话（dsh 本身单租户，无用户级会话可清）。
+      const expired = [sessionCookie('', 0)]
+      const dshCookie = expireDshCookie()
+      if (dshCookie) expired.push(dshCookie)
+      res.setHeader('Set-Cookie', expired)
       log(`登出 user=${username}`)
       sendSecurityHeaders(res)
       res.writeHead(302, { Location: '/' })
@@ -445,6 +493,7 @@ export function apply(ctx, config = {}) {
       clientLoopbackTrust: cfg.clientLoopbackTrust,
       settingsDownload: cfg.settingsFileDownload && !nativeOpenAvailable(),
       trustProxy: cfg.trustProxy,
+      dshAuth: getDshAuth(),
     })
   }
 

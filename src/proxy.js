@@ -7,9 +7,14 @@
  * Sec-Fetch-Site: same-origin，保证依赖同源校验的上游插件路由
  * （如 @anionex/dsh-vision-toolkit 的 paste-policy）也能通过；
  * 已在门卫登录闸门之后，无跨站风险。
+ *
+ * dsh 0.1.2-alpha.1 起，改三头只够过"信任围栏"（403），过不了新增的
+ * "浏览器鉴权"（401）：首页与全部 /api 请求都必须携带宿主签发的 dsh-auth-*
+ * 会话 Cookie。本文件因此额外承担一次由门卫代跑的令牌交换，详见 dshAuth 一节。
  */
 
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 
 /** HTTP hop-by-hop 头（逐跳头不能透传）。 */
 const HOP_BY_HOP = new Set([
@@ -56,6 +61,64 @@ function stripHopByHop(headers) {
     if (HOP_BY_HOP.has(name.toLowerCase())) delete out[name]
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// dsh 浏览器鉴权（0.1.2-alpha.1+）
+// ---------------------------------------------------------------------------
+
+/**
+ * 宿主 BrowserAuth 的会话 Cookie 名：'dsh-auth-' + base64url(sha256(authority))，
+ * authority 是请求 Host 头的 WHATWG 规范化结果。门卫把 Host 改写成
+ * targetHost:targetPort，所以必须用同一个 authority 反推 Cookie 名，
+ * 才能判断浏览器是否已经持有宿主会话（避免每次导航都重复交换）。
+ */
+export function dshAuthCookieName(authority) {
+  const digest = createHash('sha256').update(authority).digest('base64')
+    .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+  return `dsh-auth-${digest}`
+}
+
+/** 把宿主启动令牌附加到请求路径上。仅用于门卫→宿主这一跳，令牌绝不下发给浏览器。 */
+export function withLaunchToken(url, token) {
+  const u = new URL(url ?? '/', 'http://local')
+  u.searchParams.set('token', token)
+  return `${u.pathname}${u.search}`
+}
+
+/** Cookie 头里是否已含指定名字的项。 */
+function hasCookieNamed(header, name) {
+  for (const part of String(header ?? '').split(';')) {
+    const i = part.indexOf('=')
+    if (i >= 0 && part.slice(0, i).trim() === name) return true
+  }
+  return false
+}
+
+/** 从 Cookie 头里摘掉指定名字的项（丢弃已失效的宿主会话，为重新交换让路）。 */
+function withoutCookie(header, name) {
+  return String(header ?? '')
+    .split(';')
+    .map((s) => s.trim())
+    .filter((s) => s && s.split('=')[0] !== name)
+    .join('; ')
+}
+
+/**
+ * 首页导航判定：只有 GET/HEAD、无请求体、pathname 恰为 '/' 且未自带 token 时，
+ * 门卫才代跑令牌交换。宿主也只在 pathname '/' 上接受交换（authorizeIndex），
+ * 其余路径一律按 Cookie 判定，门卫不越权插手。
+ */
+function isIndexNavigation(req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false
+  // 有请求体时不重试：入流已被第一次尝试消费掉，重放会丢正文
+  if (req.headers['content-length'] !== undefined || req.headers['transfer-encoding'] !== undefined) return false
+  try {
+    const u = new URL(req.url ?? '/', 'http://local')
+    return u.pathname === '/' && !u.searchParams.has('token')
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -298,83 +361,113 @@ function injectTags(html, extraTags = '') {
  * @param {import('node:http').ServerResponse} res
  * @param {number} [proxyTimeoutMs] 上游响应头等待超时（毫秒），默认 60000
  * @param {number} [streamIdleTimeoutMs] 响应流空闲超时（毫秒），默认 30 分钟
- * @param {{ clientLoopbackTrust?: boolean, settingsDownload?: boolean }} [injectOpts] HTML 注入开关：
- *   clientLoopbackTrust 注入客户端 loopback 信任补丁（恢复设置持久化），默认 true；
- *   settingsDownload 无桌面环境时注入设置文件下载兜底，默认 false
+ * @param {{ clientLoopbackTrust?: boolean, settingsDownload?: boolean, trustProxy?: boolean, dshAuth?: {cookieName: string, token: string}|null }} [injectOpts]
+ *   HTML 注入与宿主鉴权开关：clientLoopbackTrust 注入客户端 loopback 信任补丁
+ *   （恢复设置持久化），默认 true；settingsDownload 无桌面环境时注入设置文件下载兜底，
+ *   默认 false；dshAuth 为 null（旧版宿主或未挂载 connection 服务）时完全跳过鉴权适配。
  */
 export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 60_000, streamIdleTimeoutMs = 30 * 60_000, injectOpts = {}) {
-  const { clientLoopbackTrust = true, settingsDownload = false, trustProxy = false } = injectOpts
+  const { clientLoopbackTrust = true, settingsDownload = false, trustProxy = false, dshAuth = null } = injectOpts
   const headers = rewriteHeaders(req.headers, targetHost, targetPort, { trustProxy })
-  const upstream = http.request({
-    host: targetHost,
-    port: targetPort,
-    method: req.method,
-    path: req.url,
-    headers,
-    agent: false,
-  }, (upRes) => {
-    // 响应头已到达：清掉请求头等待期的空闲超时，改对响应流设大的空闲超时
-    upstream.setTimeout(0)
-    const sock = upRes.socket
-    if (sock) {
-      sock.setTimeout(streamIdleTimeoutMs, () => {
-        upRes.destroy()
-        if (!res.destroyed) res.destroy()
-      })
-      const cleanup = () => sock.setTimeout(0)
-      upRes.on('end', cleanup)
-      upRes.on('close', cleanup)
-    }
 
-    // HTML 响应（dsh index.html 仅 ~12KB）：缓冲后注入 randomUUID polyfill
-    const contentType = String(upRes.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
-    if (contentType === 'text/html') {
-      const chunks = []
-      upRes.on('data', (c) => chunks.push(c))
-      upRes.on('error', () => {
-        if (!res.headersSent) {
-          res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
-          res.end('bad gateway')
-        } else {
-          res.destroy()
-        }
-      })
-      upRes.on('end', () => {
-        const extraTags = (clientLoopbackTrust ? LOOPBACK_PATCH_TAG : '') + (settingsDownload ? SETTINGS_DOWNLOAD_TAG : '')
-        const injected = injectTags(Buffer.concat(chunks).toString('utf8'), extraTags)
-        const outHeaders = stripHopByHop(upRes.headers)
-        delete outHeaders['content-length']
-        res.writeHead(upRes.statusCode ?? 502, outHeaders)
-        res.end(injected)
-      })
-      return
+  // 浏览器只见过门卫地址，拿不到宿主打印在终端里的一次性启动令牌。
+  // 门卫在「已登录用户的首页导航」上代跑令牌交换：宿主回 303 + Set-Cookie，
+  // 原样透传给浏览器保存，之后所有 /api 与 WS 请求自带会话。
+  // 令牌只出现在门卫→宿主这一跳的请求行上，不进入任何下发给浏览器的内容。
+  let path = req.url
+  let retryOn401 = false
+  if (dshAuth && isIndexNavigation(req)) {
+    if (hasCookieNamed(headers.cookie, dshAuth.cookieName)) {
+      // 浏览器自认为已有会话：先原样透传；宿主判 401（Cookie 过期、签名密钥变更）
+      // 时剥掉它重跑一次交换，避免远端用户被 401 墙困住只能清 Cookie。
+      retryOn401 = true
+    } else {
+      path = withLaunchToken(req.url, dshAuth.token)
     }
+  }
+  attempt(path, headers, retryOn401)
 
-    // 其他 Content-Type（SSE text/event-stream、json 等）：流式透传不缓冲
-    res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
-    upRes.pipe(res)
-  })
-  let timedOut = false
-  upstream.setTimeout(proxyTimeoutMs, () => {
-    timedOut = true
-    upstream.destroy()
-    if (!res.headersSent) {
-      res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('gateway timeout')
-    } else {
-      res.destroy()
-    }
-  })
-  upstream.on('error', () => {
-    if (timedOut) return
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('bad gateway')
-    } else {
-      res.destroy()
-    }
-  })
-  req.pipe(upstream)
+  function attempt(attemptPath, attemptHeaders, mayRetry) {
+    const upstream = http.request({
+      host: targetHost,
+      port: targetPort,
+      method: req.method,
+      path: attemptPath,
+      headers: attemptHeaders,
+      agent: false,
+    }, (upRes) => {
+      if (mayRetry && upRes.statusCode === 401) {
+        upRes.resume() // 丢弃宿主 401 正文，改走令牌交换
+        attempt(
+          withLaunchToken(req.url, dshAuth.token),
+          { ...attemptHeaders, cookie: withoutCookie(attemptHeaders.cookie, dshAuth.cookieName) },
+          false,
+        )
+        return
+      }
+      // 响应头已到达：清掉请求头等待期的空闲超时，改对响应流设大的空闲超时
+      upstream.setTimeout(0)
+      const sock = upRes.socket
+      if (sock) {
+        sock.setTimeout(streamIdleTimeoutMs, () => {
+          upRes.destroy()
+          if (!res.destroyed) res.destroy()
+        })
+        const cleanup = () => sock.setTimeout(0)
+        upRes.on('end', cleanup)
+        upRes.on('close', cleanup)
+      }
+
+      // HTML 响应（dsh index.html 仅 ~12KB）：缓冲后注入 randomUUID polyfill
+      const contentType = String(upRes.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+      if (contentType === 'text/html') {
+        const chunks = []
+        upRes.on('data', (c) => chunks.push(c))
+        upRes.on('error', () => {
+          if (!res.headersSent) {
+            res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
+            res.end('bad gateway')
+          } else {
+            res.destroy()
+          }
+        })
+        upRes.on('end', () => {
+          const extraTags = (clientLoopbackTrust ? LOOPBACK_PATCH_TAG : '') + (settingsDownload ? SETTINGS_DOWNLOAD_TAG : '')
+          const injected = injectTags(Buffer.concat(chunks).toString('utf8'), extraTags)
+          const outHeaders = stripHopByHop(upRes.headers)
+          delete outHeaders['content-length']
+          res.writeHead(upRes.statusCode ?? 502, outHeaders)
+          res.end(injected)
+        })
+        return
+      }
+
+      // 其他 Content-Type（SSE text/event-stream、json 等）：流式透传不缓冲
+      res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
+      upRes.pipe(res)
+    })
+    let timedOut = false
+    upstream.setTimeout(proxyTimeoutMs, () => {
+      timedOut = true
+      upstream.destroy()
+      if (!res.headersSent) {
+        res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('gateway timeout')
+      } else {
+        res.destroy()
+      }
+    })
+    upstream.on('error', () => {
+      if (timedOut) return
+      if (!res.headersSent) {
+        res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('bad gateway')
+      } else {
+        res.destroy()
+      }
+    })
+    req.pipe(upstream)
+  }
 }
 
 /**

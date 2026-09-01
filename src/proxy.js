@@ -15,6 +15,7 @@
 
 import http from 'node:http'
 import { createHash } from 'node:crypto'
+import zlib from 'node:zlib'
 
 /** HTTP hop-by-hop 头（逐跳头不能透传）。 */
 const HOP_BY_HOP = new Set([
@@ -432,9 +433,36 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
           }
         })
         upRes.on('end', () => {
-          const extraTags = (clientLoopbackTrust ? LOOPBACK_PATCH_TAG : '') + (settingsDownload ? SETTINGS_DOWNLOAD_TAG : '')
-          const injected = injectTags(Buffer.concat(chunks).toString('utf8'), extraTags)
           const outHeaders = stripHopByHop(upRes.headers)
+          let html = Buffer.concat(chunks).toString('utf8')
+          // 宿主可能按 Accept-Encoding 返回 gzip/br 压缩的 HTML（0.1.2-alpha.3 实测）：
+          // 注入前必须先解压，且响应的 content-encoding 头必须删除——否则浏览器按压缩
+          // 解码注入后的明文 → ERR_CONTENT_DECODING_FAILED。解压失败按原样发送（安全兜底）。
+          const enc = String(outHeaders['content-encoding'] ?? '').trim().toLowerCase()
+          if (enc && enc !== 'identity') {
+            try {
+              const buf = Buffer.concat(chunks)
+              const raw = enc === 'br'
+                ? zlib.brotliDecompressSync(buf)
+                : enc === 'gzip' || enc === 'x-gzip'
+                  ? zlib.gunzipSync(buf)
+                  : enc === 'deflate'
+                    ? zlib.inflateSync(buf)
+                    : null
+              if (raw) {
+                html = raw.toString('utf8')
+                delete outHeaders['content-encoding']
+              }
+            } catch (err) {
+              // 解压失败：保留原编码原样透传（不注入），避免二次破坏
+              res.writeHead(upRes.statusCode ?? 502, outHeaders)
+              upRes.unpipe()
+              res.end(Buffer.concat(chunks))
+              return
+            }
+          }
+          const extraTags = (clientLoopbackTrust ? LOOPBACK_PATCH_TAG : '') + (settingsDownload ? SETTINGS_DOWNLOAD_TAG : '')
+          const injected = injectTags(html, extraTags)
           delete outHeaders['content-length']
           res.writeHead(upRes.statusCode ?? 502, outHeaders)
           res.end(injected)

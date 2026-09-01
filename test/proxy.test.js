@@ -108,6 +108,88 @@ test('injectTags 边界安全：<header> 不被误当 <head>', async () => {
   }
 })
 
+test('gzip HTML：解压后注入，content-encoding 头被移除', async () => {
+  // 回归：dsh 0.1.2-alpha.3 按 Accept-Encoding 返回 gzip HTML，注入前必须解压，
+  // 否则浏览器按 content-encoding: gzip 解码注入后的明文 → ERR_CONTENT_DECODING_FAILED
+  const zlib = await import('node:zlib')
+  const { proxyRequest } = await import('../src/proxy.js')
+  const { startUpstream } = await import('./helpers.js')
+  const http = await import('node:http')
+
+  const html = '<html><head><title>gzip page</title></head><body><h1>hi</h1></body></html>'
+  const up = await startUpstream((req, res) => {
+    res.writeHead(200, {
+      'content-type': 'text/html',
+      'content-encoding': 'gzip',
+      'content-length': String(zlib.gzipSync(html).length),
+    })
+    res.end(zlib.gzipSync(html))
+  })
+  const srv = http.createServer((req, res) => {
+    proxyRequest(req, res, '127.0.0.1', up.port, 5000, 5000, {})
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  try {
+    const res = await new Promise((resolve, reject) => {
+      http
+        .get({ host: '127.0.0.1', port: srv.address().port, path: '/' }, (res) => {
+          const chunks = []
+          res.on('data', (c) => chunks.push(c))
+          res.on('end', () =>
+            resolve({ headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }),
+          )
+        })
+        .on('error', reject)
+    })
+    assert.equal(res.headers['content-encoding'], undefined, 'content-encoding 必须移除')
+    assert.match(res.body, /<title>gzip page<\/title>/) // 原始 HTML 完整还原
+    assert.match(res.body, /dsh-gw-logout-btn/) // 注入存在
+  } finally {
+    await up.close()
+    await new Promise((r) => srv.close(r))
+  }
+})
+
+test('br HTML：解压后注入，content-encoding 头被移除', async () => {
+  const zlib = await import('node:zlib')
+  const { proxyRequest } = await import('../src/proxy.js')
+  const { startUpstream } = await import('./helpers.js')
+  const http = await import('node:http')
+
+  const html = '<html><head><title>br page</title></head><body><p>hi</p></body></html>'
+  const up = await startUpstream((req, res) => {
+    res.writeHead(200, {
+      'content-type': 'text/html',
+      'content-encoding': 'br',
+      'content-length': String(zlib.brotliCompressSync(html).length),
+    })
+    res.end(zlib.brotliCompressSync(html))
+  })
+  const srv = http.createServer((req, res) => {
+    proxyRequest(req, res, '127.0.0.1', up.port, 5000, 5000, {})
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  try {
+    const res = await new Promise((resolve, reject) => {
+      http
+        .get({ host: '127.0.0.1', port: srv.address().port, path: '/' }, (res) => {
+          const chunks = []
+          res.on('data', (c) => chunks.push(c))
+          res.on('end', () =>
+            resolve({ headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }),
+          )
+        })
+        .on('error', reject)
+    })
+    assert.equal(res.headers['content-encoding'], undefined)
+    assert.match(res.body, /<title>br page<\/title>/)
+    assert.match(res.body, /dsh-gw-logout-btn/)
+  } finally {
+    await up.close()
+    await new Promise((r) => srv.close(r))
+  }
+})
+
 test('nativeOpenAvailable 与平台环境一致', () => {
   const expect =
     process.platform === 'darwin' || process.platform === 'win32'

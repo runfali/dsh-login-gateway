@@ -22,12 +22,19 @@ export function freePort() {
   })
 }
 
-/** 假 cordis ctx：收集 effect disposer 与日志。 */
-export function makeCtx() {
+/**
+ * 假 cordis ctx：收集 effect disposer 与日志。
+ * services 可按服务名提供 ctx.get 的答案（如 { connection: {...} } 模拟宿主
+ * 浏览器鉴权服务）；不传时 ctx.get 一律返回 undefined，等价于旧版 dsh。
+ */
+export function makeCtx(services = {}) {
   const disposers = []
   const logs = []
   return {
     ctx: {
+      get(name) {
+        return services[name]
+      },
       effect(fn) {
         disposers.push(fn())
       },
@@ -76,7 +83,7 @@ function waitForPort(port, host = '127.0.0.1', timeoutMs = 3000) {
  * seedUsers=false 时保持未初始化状态（走 /setup 引导流程测试）。
  * 返回 { port, logs, home, userStorePath, stop }。
  */
-export async function startGateway(overrides = {}, seedUsers = true) {
+export async function startGateway(overrides = {}, seedUsers = true, services = {}) {
   const [{ apply }, { hashPassword }, { saveUsersSync }] = await Promise.all([
     import('../src/index.js'),
     import('../src/auth.js'),
@@ -89,7 +96,7 @@ export async function startGateway(overrides = {}, seedUsers = true) {
       { username: 'admin', passwordHash: hashPassword('password123'), createdAt: new Date().toISOString() },
     ])
   }
-  const pack = makeCtx()
+  const pack = makeCtx(services)
   const cfg = {
     listenHost: '127.0.0.1',
     listenPort: await freePort(),

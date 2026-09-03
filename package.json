@@ -1,6 +1,6 @@
 {
   "name": "dsh-login-gateway",
-  "version": "0.3.0",
+  "version": "0.1.2-rc.1",
   "description": "DeepSeek Harness 登录门卫插件：为 dsh Web UI 提供外部访问入口 + 用户名密码登录验证",
   "type": "module",
   "main": "src/index.js",

@@ -478,7 +478,10 @@ test('门卫自产响应带 Cache-Control: no-store', async () => {
 })
 
 test('会话绑定 User-Agent：异 UA 复用 Cookie 被拒并吊销', async () => {
-  const gw = await startGateway({ bindUserAgent: true })
+  // 必须挂模拟上游：默认 targetPort=3080 在开发机上可能被真实 dsh 占用，
+  // 其浏览器鉴权会以 401 文本应答，污染「门卫自身会话语义」的断言。
+  const up = await startUpstream((req, res) => res.end('upstream-ok'))
+  const gw = await startGateway({ bindUserAgent: true, targetPort: up.port })
   try {
     // 用显式 UA 登录
     const r = await request(gw.port, 'POST', '/login', {
@@ -492,6 +495,7 @@ test('会话绑定 User-Agent：异 UA 复用 Cookie 被拒并吊销', async () 
       headers: { cookie, 'user-agent': 'Mozilla/5.0 OfficePC' },
     })
     assert.ok(same.status !== 401) // 会话有效
+    assert.equal(same.body, 'upstream-ok') // 且确实反代到了模拟上游
     // 换 UA 偷用同一 Cookie → 401（且该会话被吊销）
     const stolen = await request(gw.port, 'GET', '/api/x', {
       headers: { cookie, 'user-agent': 'curl/8.0 Attacker' },
@@ -504,11 +508,14 @@ test('会话绑定 User-Agent：异 UA 复用 Cookie 被拒并吊销', async () 
     assert.equal(afterRevoke.status, 401)
   } finally {
     gw.stop()
+    await up.close()
   }
 })
 
 test('bindUserAgent=false 时换 UA 不影响会话', async () => {
-  const gw = await startGateway({ bindUserAgent: false })
+  // 同上：挂模拟上游隔离本机真实 dsh（3080）对断言的污染。
+  const up = await startUpstream((req, res) => res.end('upstream-ok'))
+  const gw = await startGateway({ bindUserAgent: false, targetPort: up.port })
   try {
     const r = await login(gw.port)
     const cookie = cookieOf(r)
@@ -516,8 +523,10 @@ test('bindUserAgent=false 时换 UA 不影响会话', async () => {
       headers: { cookie, 'user-agent': 'SomeOtherUA/1.0' },
     })
     assert.notEqual(other.status, 401)
+    assert.equal(other.body, 'upstream-ok')
   } finally {
     gw.stop()
+    await up.close()
   }
 })
 

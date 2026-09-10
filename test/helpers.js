@@ -30,7 +30,9 @@ export function freePort() {
 export function makeCtx(services = {}) {
   const disposers = []
   const logs = []
+  const levels = [] // 与 logs 平行的级别记录：断言插件走了 warn/error 而非一律 info
   return {
+    levels,
     ctx: {
       get(name) {
         return services[name]
@@ -39,7 +41,13 @@ export function makeCtx(services = {}) {
         disposers.push(fn())
       },
       logger() {
-        return { info: (...a) => logs.push(a.map(String).join(' ')) }
+        // 与真实 cordis logger 一致：分级方法齐备。插件按级别调用（warn/error），
+        // 只提供 info 会让分级降级逻辑被静默绕过（测试假绿）。
+        const record = (level) => (...a) => {
+          levels.push(level)
+          logs.push(a.map(String).join(' '))
+        }
+        return { info: record('info'), warn: record('warn'), error: record('error'), fatal: record('fatal') }
       },
     },
     logs,

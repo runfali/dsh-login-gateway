@@ -112,3 +112,55 @@ test('.gitignore 忽略内部文档目录', () => {
   const ignore = readFileSync(path.join(root, '.gitignore'), 'utf8')
   assert.match(ignore, /^docs\/$/m, 'docs/ 必须被 git 忽略（内部审计与调研文档不外发）')
 })
+
+test('版本与兼容声明一致：engines 区间必须覆盖本仓库当前版本', () => {
+  // npm semver 预发布规则：区间内必须出现同元组预发布，预发布版才被满足。
+  // 这条用例用「手工判定表」把该规则固化，防止再出现「声明 0.1.5 却不被自己区间覆盖」。
+  const range = pkg.dsh?.engines?.dsh
+  assert.ok(typeof range === 'string' && range.length > 0, '必须声明 dsh.engines.dsh')
+  const version = pkg.version
+  const parse = (v) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(v)
+    if (!m) throw new Error(`无法解析版本：${v}`)
+    return { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] ?? null }
+  }
+  const cmp = (a, b) => {
+    for (const k of ['major', 'minor', 'patch']) if (a[k] !== b[k]) return a[k] < b[k] ? -1 : 1
+    if (a.pre === b.pre) return 0
+    if (a.pre === null) return 1 // 正式版 > 预发布
+    if (b.pre === null) return -1
+    const an = a.pre.split('.'), bn = b.pre.split('.')
+    for (let i = 0; i < Math.max(an.length, bn.length); i++) {
+      const x = an[i], y = bn[i]
+      if (x === undefined) return -1
+      if (y === undefined) return 1
+      const nx = /^\d+$/.test(x), ny = /^\d+$/.test(y)
+      if (nx && ny) { if (+x !== +y) return +x < +y ? -1 : 1; continue }
+      if (nx !== ny) return nx ? -1 : 1
+      if (x !== y) return x < y ? -1 : 1
+    }
+    return 0
+  }
+  // 逐段判定：'||' 分割，每段由 >= 下界与 < 上界组成
+  const satisfied = range.split('||').some((clause) => {
+    const [lo, hi] = clause.trim().split(/\s+/)
+    if (!lo?.startsWith('>=') || !hi?.startsWith('<')) return false
+    const lower = parse(lo.slice(2)), upper = parse(hi.slice(1)), ver = parse(version)
+    if (cmp(ver, lower) < 0) return false
+    if (cmp(ver, upper) >= 0) return false
+    // 预发布例外：版本本身是预发布时，需同元组预发布出现在区间内
+    if (ver.pre !== null) {
+      const sameTuplePreInRange = lower.pre !== null && lower.major === ver.major && lower.minor === ver.minor && lower.patch === ver.patch
+        || upper.pre !== null && upper.major === ver.major && upper.minor === ver.minor && upper.patch === ver.patch
+      if (!sameTuplePreInRange) return false
+    }
+    return true
+  })
+  assert.ok(satisfied, `本仓库版本 ${version} 不被自己声明的 engines 区间「${range}」覆盖`)
+})
+
+test('engines 必须显式覆盖 0.1.5 预发布段（本仓的目标 dsh 版本）', () => {
+  const range = pkg.dsh?.engines?.dsh ?? ''
+  // 只要区间里出现 >=0.1.5-alpha.x 或 >=0.1.5-rc.x，即认为覆盖（配合上一条的通用判定）
+  assert.match(range, />=\s*0\.1\.5-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.1.5 预发布下界')
+})

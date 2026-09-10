@@ -1,6 +1,6 @@
 {
   "name": "dsh-login-gateway",
-  "version": "0.1.2-rc.1",
+  "version": "0.1.5-rc.1",
   "description": "DeepSeek Harness 登录门卫插件：为 dsh Web UI 提供外部访问入口 + 用户名密码登录验证",
   "type": "module",
   "main": "src/index.js",
@@ -17,7 +17,7 @@
   },
   "dsh": {
     "engines": {
-      "dsh": ">=0.1.2-alpha.3 <0.2.0"
+      "dsh": ">=0.1.2-alpha.3 <0.2.0 || >=0.1.5-alpha.1 <0.1.6"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"

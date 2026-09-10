@@ -421,6 +421,10 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
 
       // HTML 响应（dsh index.html 仅 ~12KB）：缓冲后注入 randomUUID polyfill
       const contentType = String(upRes.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+      // HEAD 语义：绝不发响应体。上游 HEAD 可能只回 header（无正文），此处若照样
+      // 写注入后的正文，Node 会按 HEAD 丢掉 body 却已声明 content-length →
+      // keep-alive 连接上出现 framing 错位（实测下一个请求 ECONNRESET）。
+      const isHeadRequest = req.method === 'HEAD'
       if (contentType === 'text/html') {
         const chunks = []
         upRes.on('data', (c) => chunks.push(c))
@@ -461,11 +465,16 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
               return
             }
           }
-          const extraTags = (clientLoopbackTrust ? LOOPBACK_PATCH_TAG : '') + (settingsDownload ? SETTINGS_DOWNLOAD_TAG : '')
-          const injected = injectTags(html, extraTags)
+          // 只对 2xx 的 HTML 注入：404/500 等错误页不是应用外壳，注入悬浮改密条与
+          // loopback 补丁没有意义（还可能让人误以为已登录），一律原样透传。
+          const injectable = (upRes.statusCode ?? 200) < 300
+          const extraTags = injectable
+            ? (clientLoopbackTrust ? LOOPBACK_PATCH_TAG : '') + (settingsDownload ? SETTINGS_DOWNLOAD_TAG : '')
+            : ''
+          const injected = injectable ? injectTags(html, extraTags) : html
           delete outHeaders['content-length']
           res.writeHead(upRes.statusCode ?? 502, outHeaders)
-          res.end(injected)
+          res.end(isHeadRequest ? undefined : injected)
         })
         return
       }

@@ -5,6 +5,29 @@
 
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 
+/**
+ * 请求字段的安全取值：只接受字符串（数字按字面量转换），其余一律空串。
+ * JSON 里塞 {"password":{"toString":1}} 这类值会让 String() 抛
+ * "Cannot convert object to primitive value"，被外层 catch 变成 500——
+ * 这是纯粹的输入校验缺失，不该升级成服务端错误。
+ */
+export function asString(value) {
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  return ''
+}
+
+/**
+ * 客户端地址规范化：IPv4-mapped IPv6（::ffff:1.2.3.4，Node 在双栈监听下对 IPv4
+ * 客户端的常见形态）统一还原成 1.2.3.4，避免同一台主机以两种表示各占一个限速桶。
+ */
+export function normalizeIp(addr) {
+  const s = typeof addr === 'string' ? addr.trim() : ''
+  if (!s) return 'unknown'
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(s)
+  return (mapped ? mapped[1] : s).slice(0, 128)
+}
+
 /** 会话绑定的客户端指纹键：UA 的短哈希；无 UA 头时为固定值（保持一致性即可）。 */
 export function uaBindKey(userAgent) {
   return createHash('sha256').update(String(userAgent ?? '')).digest('hex').slice(0, 16)

@@ -17,7 +17,7 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { checkNewPassword, fakeVerify, GlobalAuthThrottle, hashPassword, LoginLimiter, safeEqualStr, SessionStore, uaBindKey, verifyPassword } from './auth.js'
+import { asString, checkNewPassword, fakeVerify, GlobalAuthThrottle, hashPassword, LoginLimiter, normalizeIp, safeEqualStr, SessionStore, uaBindKey, verifyPassword } from './auth.js'
 import { dshAuthCookieName, nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
 import { defaultSettingsFilePath, settingsFilePayload } from './settings-file.js'
 import { loadUsersSync, saveUsersSync } from './user-store.js'
@@ -88,7 +88,10 @@ async function readJsonBody(req) {
     if (total > MAX_BODY) return null
   }
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    // 只接受对象载荷：数组/null/标量一律当作非法请求体，调用方统一回 400
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    return parsed
   } catch {
     return null
   }
@@ -281,11 +284,11 @@ export function apply(ctx, config = {}) {
         const parts = xff.split(',').map((s) => s.trim()).filter(Boolean)
         if (parts.length > 0) {
           const hops = Math.min(Math.max(1, cfg.trustedProxyHops), parts.length)
-          return parts[parts.length - hops].slice(0, 128)
+          return normalizeIp(parts[parts.length - hops])
         }
       }
     }
-    return req.socket.remoteAddress ?? 'unknown'
+    return normalizeIp(req.socket.remoteAddress)
   }
 
   /** 日志字段净化：防换行/控制字符伪造审计日志条目（日志注入）。 */
@@ -346,8 +349,8 @@ export function apply(ctx, config = {}) {
       : `失败次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试`
     const body = await readJsonBody(req)
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
-    const username = String(body.username ?? '').trim()
-    const password = String(body.password ?? '')
+    const username = asString(body.username).trim()
+    const password = asString(body.password)
     // 用户名维度的限速键统一小写，防 'Admin'/'ADMIN' 变体稀释锁定
     const usernameKey = username.toLowerCase()
     const preLock = limiter.lockedBy(ip, usernameKey)
@@ -390,10 +393,10 @@ export function apply(ctx, config = {}) {
     }
     const body = await readJsonBody(req)
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
-    const token = String(body.token ?? '').trim()
-    const username = String(body.username ?? '').trim()
-    const password = String(body.password ?? '')
-    const password2 = String(body.password2 ?? '')
+    const token = asString(body.token).trim()
+    const username = asString(body.username).trim()
+    const password = asString(body.password)
+    const password2 = asString(body.password2)
     if (!safeEqualStr(token, setupToken)) return fail('一次性令牌不正确')
     if (!username) return fail('用户名不能为空')
     if (username.length > 64) return fail('用户名长度不能超过 64 个字符')
@@ -429,9 +432,9 @@ export function apply(ctx, config = {}) {
     const body = await readJsonBody(req)
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
     if (authThrottled(req, res, 'change-password')) return
-    const oldPassword = String(body.oldPassword ?? '')
-    const newPassword = String(body.newPassword ?? '')
-    const newPassword2 = String(body.newPassword2 ?? '')
+    const oldPassword = asString(body.oldPassword)
+    const newPassword = asString(body.newPassword)
+    const newPassword2 = asString(body.newPassword2)
     const user = users.find((u) => u.username === session.username)
     if (!user || !verifyPassword(oldPassword, user.passwordHash)) {
       const remaining = changePwLimiter.recordFailure(ip, usernameKey)

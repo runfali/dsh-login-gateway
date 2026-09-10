@@ -124,3 +124,37 @@ test('上游用普通 HTTP 响应拒绝 WS 升级时，浏览器立刻收到该�
     await up.close()
   }
 })
+
+test('上游响应中途断开时，门卫立刻收尾（不把连接挂到超时）', async () => {
+  const up = await startUpstream((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' })
+    res.write('partial')
+    setTimeout(() => res.socket.destroy(), 30)
+  })
+  const gw = await startGateway({ targetPort: up.port })
+  try {
+    const jar = cookieOf(await login(gw.port))
+    const started = Date.now()
+    const outcome = await new Promise((resolve) => {
+      const sock = net.connect(gw.port, '127.0.0.1')
+      // 必须有 data 监听（消费响应字节）：无消费者的 socket 处于 paused 态，
+      // 连 FIN/close 都读不到，用例会假超时（真实浏览器一定在消费）。
+      sock.on('data', () => {})
+      sock.setTimeout(3000, () => {
+        sock.destroy()
+        resolve('TIMEOUT')
+      })
+      sock.on('close', () => resolve('closed'))
+      sock.on('error', () => resolve('closed'))
+      sock.on('connect', () =>
+        sock.write('GET /api/x HTTP/1.1\r\nHost: x\r\nCookie: ' + jar + '\r\nConnection: close\r\n\r\n'),
+      )
+    })
+    const elapsed = Date.now() - started
+    assert.equal(outcome, 'closed')
+    assert.ok(elapsed < 1500, `应在中断后立刻收尾，实际 ${elapsed}ms`)
+  } finally {
+    gw.stop()
+    await up.close()
+  }
+})

@@ -438,6 +438,28 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
         upRes.on('close', cleanup)
       }
 
+      // 上游在响应中途断开（RST/未发完就 destroy）：Node 依次给 upRes 发
+      // 'aborted' → 'error' → 'close'(complete=false)。原本只有 HTML 分支在
+      // upRes.on('error') 里收尾，其余分支靠管道自然收尾；若响应头已发出，
+      // 请求侧的 upstream.on('error') 仅 res.destroy()，浏览器拿到的是"半截响应"，
+      // 既不完整也不报错，只能干等超时。
+      // 这里统一收口：尚未开始回送就回 502，已开始则立刻掐断连接（浏览器立即报错）。
+      // 'aborted' 与 close+complete=false 都挂上，重复触发时 headersSent/destroyed
+      // 判断天然幂等。
+      const onUpstreamIncomplete = () => {
+        if (!res.headersSent) {
+          if (res.destroyed) return
+          res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end('bad gateway')
+        } else if (!res.destroyed) {
+          res.destroy()
+        }
+      }
+      upRes.on('aborted', onUpstreamIncomplete)
+      upRes.on('close', () => {
+        if (upRes.complete === false) onUpstreamIncomplete()
+      })
+
       // HTML 响应（dsh index.html 仅 ~12KB）：缓冲后注入 randomUUID polyfill
       const contentType = String(upRes.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
       // HEAD 语义：绝不发响应体。上游 HEAD 可能只回 header（无正文），此处若照样

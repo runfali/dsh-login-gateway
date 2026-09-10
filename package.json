@@ -11,7 +11,14 @@
   "scripts": {
     "test": "node --test"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/runfali/dsh-login-gateway.git"
+  },
   "dsh": {
+    "engines": {
+      "dsh": ">=0.1.2-alpha.3 <0.2.0"
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
@@ -32,7 +39,10 @@
     "bin",
     "src",
     "lib",
-    "cordis.patch.yml"
+    "docs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
   ],
   "keywords": [
     "dsh",
@@ -42,6 +52,6 @@
     "gateway"
   ],
   "engines": {
-    "node": ">=22"
+    "node": "^22.19.0 || >=24.0.0"
   }
 }

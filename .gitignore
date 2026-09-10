@@ -1,4 +1,13 @@
+node_modules/
+.pnpm-store/
+pnpm-lock.yaml
+package-lock.json
+*.log
+.DS_Store
 
 # AI code intelligence tool outputs
 graphify-out/
 .code-review-graph/
+
+# 本地测试/打包产物
+*.tgz

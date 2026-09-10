@@ -17,7 +17,7 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { asString, checkNewPassword, fakeVerifyAsync, GlobalAuthThrottle, hashPassword, LoginLimiter, normalizeIp, safeEqualStr, SessionStore, uaBindKey, verifyPasswordAsync } from './auth.js'
+import { asString, checkNewPassword, checkUsername, fakeVerifyAsync, GlobalAuthThrottle, hashPassword, LoginLimiter, normalizeIp, safeEqualStr, SessionStore, uaBindKey, verifyPasswordAsync } from './auth.js'
 import { dshAuthCookieName, nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
 import { defaultSettingsFilePath, settingsFilePayload } from './settings-file.js'
 import { loadUsersSync, saveUsersSync } from './user-store.js'
@@ -400,6 +400,10 @@ export function apply(ctx, config = {}) {
     if (!safeEqualStr(token, setupToken)) return fail('一次性令牌不正确')
     if (!username) return fail('用户名不能为空')
     if (username.length > 64) return fail('用户名长度不能超过 64 个字符')
+    // 用户名一律存原始大小写、比对大小写敏感；限制字符集保证日志不可注入
+    // （日志字段另有 clean() 净化），并避免全角空白/零宽字符造成的"看不见的差异"。
+    const usernameIssue = checkUsername(username)
+    if (usernameIssue) return fail(usernameIssue)
     if (password.length < 8) return fail('密码长度至少 8 位')
     const weakReason = checkNewPassword(password)
     if (weakReason) return fail(weakReason)

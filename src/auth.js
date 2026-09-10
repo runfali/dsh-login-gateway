@@ -164,6 +164,19 @@ const WEAK_PASSWORDS = new Set([
 ])
 
 /**
+ * 用户名字符集检查：返回 null=通过；字符串=拒绝原因。
+ * 允许中英文、数字与 . _ - @ +，其余（空白、控制字符、标点）一律拒绝。
+ */
+export function checkUsername(username) {
+  const u = String(username ?? '')
+  if (u !== u.trim()) return '用户名首尾不能有空格'
+  if (/\s/.test(u)) return '用户名不能包含空白字符'
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(u)) return '用户名不能包含控制字符'
+  if (!/^[\p{L}\p{N}._@+-]+$/u.test(u)) return '用户名只能包含中英文、数字与 . _ - @ +'
+  return null
+}
+
+/**
  * 新密码强度检查：返回 null=通过；字符串=拒绝原因。
  * 规则：≥8 位（调用方已查）、非黑名单、非纯数字、非单一字符重复。
  */

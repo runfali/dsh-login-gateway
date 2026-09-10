@@ -279,6 +279,22 @@ rm -rf ~/.dsh-login-gateway/
   首页/静态资源反代、WebSocket 通道（`/api/remote.mux` 升级为 `101`）三条主链全部正常；
   对照实验证明「直连宿主同请求被 403 拒」——门卫改写三头仍是必需。
 
+## 供应链约束（无安装脚本 / 无 gyp / 预编译随包）
+
+本插件对安装期行为有硬约束，且由 `test/supply-chain.test.js` **可执行地守护**
+（任何未来改动引入脚本或原生依赖都会让测试变红）：
+
+| 约束 | 现状 | 说明 |
+| --- | --- | --- |
+| **不得有 npm 安装脚本** | ✅ 无 | `package.json` 只有 `test` 一个脚本；无 `preinstall`/`install`/`postinstall`/`prepare` 等任何生命周期钩子 |
+| **不得有 gyp / 原生扩展** | ✅ 无 | 无 `binding.gyp`、无 `*.node`、无 `node-gyp` 调用；纯 ESM |
+| **安装期零构建（能预编译就预编译）** | ✅ 满足 | 源码即产物：`src/*.js` 直接就是 host 入口，`lib/client.js` 是**手写并随包提交**的预编译 client bundle（零 `require`），无 build 步骤 |
+| **零第三方运行时依赖** | ✅ 无 | 只用 `node:` 内置模块（`crypto/fs/http/https/net/os/path/zlib`），不产生依赖树，因而也没有传递依赖的安装脚本案 |
+| **发布面不含内部文档** | ✅ 已收敛 | `files` 只含 `bin/src/lib/cordis.patch.yml/README.md/LICENSE`；`docs/`（审计与适配调研）已被 `.gitignore` 忽略，仅本地留存 |
+
+因此 `dsh plugin add` 对本插件的动作只有「建立符号链接 + 登记 bundles」，安装期不存在任何
+可执行代码，也没有需要编译的二进制——供应链面等于「你读到的 JS 就是跑起来的 JS」。
+
 ## 测试
 
 ```bash
@@ -288,6 +304,8 @@ npm test   # node --test test/（零依赖，node:test 内置框架）
 覆盖：密码哈希与篡改检测、会话过期/容量上限、限速锁定/双维度/TTL、请求头改写与走私防护、注入点边界安全、认证闸门、反代透传、WS 升级握手（含上游以非 101 拒绝时立刻回传）、setup 引导全流程、改密与会话吊销、审计日志与日志注入净化；以及宿主浏览器鉴权适配（Cookie 名反推对真实抓包向量、令牌交换、失效 Cookie 自愈、令牌不下发浏览器、非首页路径不掺令牌、登出连带吊销宿主会话、旧版宿主行为不变）。
 
 另含 2026-09-10 审计轮次的回归：空 users 文件按未初始化、大小写无关的用户名桶、改密锁与登录锁互不污染、HSTS/nosniff、`trustedProxyHops`、日志分级、HEAD 响应框架、JSON 类型混淆不再 500、IPv4-mapped IPv6 归并、错误页不注入、绝对形式请求行折叠、异步 scrypt 不阻塞事件循环、用户名字符集与哈希参数上界。
+
+以及 dsh 0.1.5-rc.1 适配回归：client bundle 行为（`remote.\$host.hostFacts` 缓存修正、persistence 兜底、异常静默）与 0.1.5 形状的宿主鉴权链（逐字复刻新版 `authorizeIndex` 语义与 401 文案）；外加供应链约束守护（见上节）。
 
 > 回归用例的质量标准：每项修复先写探针复现，且新用例在校验「修复前代码」时必须失败（本轮 26 例中 5 例经此对照确认，其余为新增语义覆盖）。
 

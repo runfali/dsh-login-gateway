@@ -526,6 +526,30 @@ export function proxyUpgrade(req, socket, head, targetHost, targetPort, proxyTim
     if (!socket.destroyed) socket.destroy()
   })
 
+  /**
+   * 上游用普通 HTTP 响应（非 101）拒绝升级时（403/404/401 等），把状态行与响应头
+   * 原样回给浏览器再拆除两端。缺了这条，响应落到 http.request 上没人消费，
+   * 浏览器侧会一直挂在"连接中"直到超时（实测 40s 无任何字节且不关闭）。
+   */
+  upstream.on('response', (upRes) => {
+    upstream.setTimeout(0)
+    if (socket.destroyed) {
+      upRes.resume()
+      return
+    }
+    upRes.resume() // 升级被拒时正文无意义，排空后即拆
+    const raw = upRes.rawHeaders ?? []
+    let response = `HTTP/1.1 ${upRes.statusCode ?? 502} ${upRes.statusMessage ?? ''}\r\n`
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      const name = String(raw[i]).toLowerCase()
+      if (HOP_BY_HOP.has(name) || name === 'content-length' || name === 'content-encoding') continue
+      response += `${raw[i]}: ${raw[i + 1]}\r\n`
+    }
+    response += 'Content-Length: 0\r\nConnection: close\r\n\r\n'
+    socket.write(response)
+    socket.end()
+  })
+
   upstream.on('upgrade', (upRes, upSocket, upHead) => {
     upstream.setTimeout(0)
     // 用后端的 rawHeaders 原样构造 101 响应（含 sec-websocket-accept）

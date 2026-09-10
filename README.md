@@ -153,6 +153,7 @@ rm -rf ~/.dsh-login-gateway/
 | `userStorePath` | `~/.dsh-login-gateway/users.json` | 用户数据文件路径（可自定义） |
 | `maxSessions` | `1000` | 会话容量上限，超出后逐出最旧会话，防止反复登录刷爆内存 |
 | `trustProxy` | `false` | 前置 TLS 反代（nginx/caddy）时设 `true`：从 `X-Forwarded-For` 取真实客户端 IP 参与限速。**直连场景必须保持 `false`**，否则攻击者可伪造该头绕过限速；为 `false` 时门卫会剥离伪造的 XFF/X-Real-IP/Forwarded 头再转发上游 |
+| `trustedProxyHops` | `1` | 仅 `trustProxy: true` 时有意义：可信代理层数，取 XFF **右起第 N 段**作为客户端 IP（前置反代会把直连对端追加在最右，客户端伪造只能往左侧追加）。链路是「CDN → nginx → 门卫」时按可信层数调大（如 2） |
 | `secureCookie` | `false` | 仅经 HTTPS 访问门卫时设 `true`：会话 Cookie 追加 `Secure` 标记 |
 | `globalAuthRatePerMinute` | `30` | 全局认证节流：每分钟最多 `30` 次触发密码计算的尝试（登录+改密合计，超限直接 429 不消耗计算）。防止攻击者轮换 IP+用户名绕开双维度锁定后打满 CPU |
 | `bindUserAgent` | `true` | 会话绑定 User-Agent：被嗅探的 Cookie 在不同客户端上不可复用（异 UA 访问会立即吊销该会话）。浏览器升级换 UA 后需重新登录一次；设 `false` 关闭 |
@@ -166,10 +167,11 @@ rm -rf ~/.dsh-login-gateway/
 - **登录**：打开 `http://<主机>:3081/`，输入用户名密码。成功后会种下会话 Cookie（`dsh_gw_session`，`HttpOnly` + `SameSite=Strict`），之后访问全部走反代，包括 WebSocket。
 - **修改密码**：页面右下角悬浮栏点「改密」，验证当前密码后设置新密码（至少 8 位）。改密成功会**自动下线该账号的其他所有会话**（当前浏览器保持登录），旧凭据即使泄露也随即失效。
 - **登出**：悬浮栏「退出」按钮；无界面时可直接调用：`curl -X POST http://<主机>:3081/logout`。
-- **未登录访问**：`/` 返回登录页；其余路径返回 `401` JSON。
-- **登录限速**：同一 IP 连续输错 `maxLoginAttempts` 次会被锁定 `lockMinutes` 分钟。
+- **未登录访问**：`/` 返回登录页；其余路径返回 `401` JSON（浏览器导航式请求给「登录已失效，请刷新页面或重新访问 / 登录」，接口请求给「未登录，请先访问 / 登录」）。
+- **登录限速**：同一 IP 连续输错 `maxLoginAttempts` 次会被锁定 `lockMinutes` 分钟。被锁定期间即使密码正确也会被拒（`lockMinutes` 后自动解除）。
 - **账号锁定**：同一用户名跨 IP 累计失败 `maxLoginAttempts` 次也会被锁定，可防代理池分布式爆破。
-- **初始化限速**：`/setup` 同样按 IP 限速，令牌错误、用户名空、密码过短、两次密码不一致都计失败。
+- **初始化限速**：`/setup` 同样按 IP 限速，令牌错误、用户名空或不合规、密码过短、两次密码不一致都计失败。
+- **改密限速（独立）**：`/change-password` 用独立限速表，连错 `maxLoginAttempts` 次会锁定改密入口 `lockMinutes` 分钟；**不影响用正确密码登录**（登录有自己的桶，登录成功即清零）。用户名合规字符集：中英文、数字与 `._-@+`，≤64 字符。
 - **审计日志**：登录成功/失败、锁定触发、登出、改密、初始化全程留痕（含来源 IP 与用户名），可在 dsh 日志中检索 `login-gateway` 前缀审计。
 
 ## 安全说明
@@ -214,7 +216,10 @@ rm -rf ~/.dsh-login-gateway/
 - **审计日志**：登录成败、锁定、登出、改密全程留痕（IP+用户名），日志字段净化换行与控制字符防伪造条目。
 - **反代超时**：上游响应头等待超 `proxyTimeoutMs` 返回 `504`；响应头到达后改用 `streamIdleTimeoutMs` 空闲超时，SSE 长间隔输出不会被正常打断。
 - **并发连接上限**：`maxConnections` 默认 `512`，并显式收紧 `headersTimeout`、`requestTimeout`、`keepAliveTimeout`，减少慢连接占用。
-- **安全响应头**：门卫自己生成的响应统一带 `X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 和 CSP；反代透传的 dsh 响应保持原样。
+- **安全响应头**：门卫自己生成的响应统一带 `X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`X-Content-Type-Options: nosniff` 和 CSP；`secureCookie`（HTTPS 部署）时额外下发 `Strict-Transport-Security: max-age=31536000`，明文部署绝不下发 HSTS。反代透传的 dsh 响应保持原样。
+- **请求行规范化**：绝对形式（`GET http://host/x`）与网络路径形式（`GET //host/x`）一律折叠成 `path?query` 再送上游，避免请求行里的 authority 与已改写的 Host 不一致（origin 混淆/缓存投毒面）。
+- **密码校验不阻塞服务**：scrypt 走 libuv 线程池（异步）。门卫与 dsh 同进程，同步实现会在每次登录/改密校验时卡住整条事件循环（含正在流式输出的对话）。
+- **输入校验与边界**：请求体只接受 JSON 对象、上限 100KB（超限正常回 400 并排空入流，不会 RST 连接）；用户名限中英文/数字与 `._-@+` 且 ≤64 字符；哈希文件被篡改出越界 scrypt 参数（N/r/p 过大）时直接判失败，不会拖垮进程。
 - 登录/初始化接口有请求体大小上限（`100KB`），防止恶意超大请求。
 
 ## 重置与常见问题
@@ -248,7 +253,7 @@ rm -rf ~/.dsh-login-gateway/
 | dsh | 状态 |
 | --- | --- |
 | `0.1.0-rc.*` / `0.1.1-rc.*` | ✅ 正常工作（无宿主浏览器鉴权，适配逻辑整体跳过） |
-| `0.1.2-alpha.1` 及以上 | ✅ 需要本仓库 ≥ 0.3.0；0.2.0 及更早版本登录后首页与全部 `/api` 一律 401 |
+| `0.1.2-alpha.1` 及以上 | ✅ 需要本仓库 ≥ 0.3.0（当前 0.1.2-rc.1）；0.2.0 及更早的门卫版本登录后首页与全部 `/api` 一律 401 |
 
 升级 dsh 后无需改动门卫配置：令牌交换由门卫自动完成，浏览器首次访问首页时静默换取宿主会话。
 
@@ -258,14 +263,18 @@ rm -rf ~/.dsh-login-gateway/
 npm test   # node --test test/（零依赖，node:test 内置框架）
 ```
 
-覆盖：密码哈希与篡改检测、会话过期/容量上限、限速锁定/双维度/TTL、请求头改写与走私防护、注入点边界安全、认证闸门、反代透传、WS 升级握手、setup 引导全流程、改密与会话吊销、审计日志与日志注入净化；以及宿主浏览器鉴权适配（Cookie 名反推对真实抓包向量、令牌交换、失效 Cookie 自愈、令牌不下发浏览器、非首页路径不掺令牌、登出连带吊销宿主会话、旧版宿主行为不变）。
+覆盖：密码哈希与篡改检测、会话过期/容量上限、限速锁定/双维度/TTL、请求头改写与走私防护、注入点边界安全、认证闸门、反代透传、WS 升级握手（含上游以非 101 拒绝时立刻回传）、setup 引导全流程、改密与会话吊销、审计日志与日志注入净化；以及宿主浏览器鉴权适配（Cookie 名反推对真实抓包向量、令牌交换、失效 Cookie 自愈、令牌不下发浏览器、非首页路径不掺令牌、登出连带吊销宿主会话、旧版宿主行为不变）。
+
+另含 2026-09-10 审计轮次的回归：空 users 文件按未初始化、大小写无关的用户名桶、改密锁与登录锁互不污染、HSTS/nosniff、`trustedProxyHops`、日志分级、HEAD 响应框架、JSON 类型混淆不再 500、IPv4-mapped IPv6 归并、错误页不注入、绝对形式请求行折叠、异步 scrypt 不阻塞事件循环、用户名字符集与哈希参数上界。
+
+> 回归用例的质量标准：每项修复先写探针复现，且新用例在校验「修复前代码」时必须失败（本轮 26 例中 5 例经此对照确认，其余为新增语义覆盖）。
 
 ## 目录结构
 
 ```text
 src/
   index.js        插件主入口：配置校验、路由分发、setup 引导、改密、审计日志、HTTP 服务 + WS 升级
-  auth.js         密码哈希（scrypt）、会话存储（容量上限）、登录限速（双维度+TTL）、恒定时间比较
+  auth.js         密码哈希（scrypt，含异步校验）、会话存储（容量上限）、登录限速（双维度+TTL）、恒定时间比较、输入规范化（asString/normalizeIp/checkUsername）
   proxy.js        HTTP 反代（头改写 + hop-by-hop 剔除 + 走私防护）、宿主浏览器鉴权交换、WebSocket 升级转发
   user-store.js   用户文件存储（JSON + 原子写入）
   settings-file.js dsh 设置文件下载辅助（无桌面环境兜底）
@@ -282,4 +291,6 @@ test/
   proxy.test.js   反代头处理单测
   gateway.test.js 端到端集成测试（认证闸门/反代/setup/WS/改密/审计）
   browser-auth.test.js 宿主浏览器鉴权适配（假 dsh 上游复刻 BrowserAuth 语义）
+  gateway-nav.test.js   深链 401 文案与 WS 升级被拒回归
+  gateway-round4/5/6.test.js 审计轮次回归（极端输入、请求行规范化、用户名字符集）
 ```

@@ -39,11 +39,9 @@ export function uaBindKey(userAgent) {
  */
 export function hashPassword(password) {
   const salt = randomBytes(16)
-  const N = 16384
-  const r = 8
-  const p = 1
+  const { N, r, p } = SCRYPT_PARAMS
   const hash = scryptSync(password, salt, 64, { N, r, p })
-  return `scrypt$${N}$${r}$${p}$${salt.toString('base64')}$${hash.toString('base64')}`
+  return formatHash(N, r, p, salt, hash)
 }
 
 /** 校验密码与存储哈希是否匹配（恒定时间比较，防时序攻击）。 */

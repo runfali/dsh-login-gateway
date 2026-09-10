@@ -5,7 +5,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { hashPassword, verifyPassword, fakeVerify, safeEqualStr, checkNewPassword, GlobalAuthThrottle, SessionStore, LoginLimiter } from '../src/auth.js'
+import { hashPassword, verifyPassword, verifyPasswordAsync, fakeVerifyAsync, safeEqualStr, checkNewPassword, GlobalAuthThrottle, SessionStore, LoginLimiter } from '../src/auth.js'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -99,8 +99,28 @@ test('LoginLimiter sweep 清理过期未锁定记录与已到期锁', async () =
   assert.equal(l.recordFailure('1.1.1.1', 'dave'), 99)
 })
 
-test('fakeVerify 消耗等价时间且不抛错（反枚举哑校验）', () => {
-  assert.doesNotThrow(() => fakeVerify('anything'))
+test('fakeVerifyAsync 消耗等价计算且不抛错（反枚举哑校验）', async () => {
+  await assert.doesNotReject(() => fakeVerifyAsync('anything'))
+})
+
+test('verifyPasswordAsync 与同步版结果一致，且非法哈希不抛', async () => {
+  const h = hashPassword('secret-password')
+  assert.equal(await verifyPasswordAsync('secret-password', h), true)
+  assert.equal(await verifyPasswordAsync('wrong-password', h), false)
+  assert.equal(await verifyPasswordAsync('x', 'garbage'), false)
+  assert.equal(await verifyPasswordAsync('x', 'scrypt$1$1$1$!!!$!!!'), false)
+  // 篡改参数超出安全上界：不抛、不爆内存、直接 false
+  assert.equal(await verifyPasswordAsync('x', 'scrypt$1073741824$8$1$AAAA$AAAA'), false)
+})
+
+test('verifyPasswordAsync 不阻塞事件循环（scrypt 走线程池）', async () => {
+  const h = hashPassword('secret-password')
+  let ticks = 0
+  const timer = setInterval(() => { ticks += 1 }, 1)
+  await Promise.all([verifyPasswordAsync('secret-password', h), verifyPasswordAsync('wrong', h)])
+  clearInterval(timer)
+  // 同步 scrypt 会独占事件循环（~40ms×2），异步版应留下多次定时器回调
+  assert.ok(ticks >= 5, `事件循环被阻塞，timer tick=${ticks}`)
 })
 
 test('GlobalAuthThrottle 窗口计数与重置', () => {

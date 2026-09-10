@@ -3,7 +3,7 @@
  * 零外部依赖，全部使用 node:crypto 内置实现（scrypt）。
  */
 
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto'
 
 /**
  * 请求字段的安全取值：只接受字符串（数字按字面量转换），其余一律空串。
@@ -63,6 +63,55 @@ export function verifyPassword(password, stored) {
   }
 }
 
+/** scrypt 参数（哈希与校验共用，保证旧哈希仍可校验）。 */
+const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 }
+
+/** 密码哈希格式：scrypt$N$r$p$saltB64$hashB64 */
+function formatHash(N, r, p, salt, hash) {
+  return `scrypt$${N}$${r}$${p}$${salt.toString('base64')}$${hash.toString('base64')}`
+}
+
+/** 解析自描述哈希；格式非法/参数超出安全范围返回 null（不抛）。 */
+function parseHash(stored) {
+  const parts = String(stored).split('$')
+  if (parts.length !== 6 || parts[0] !== 'scrypt') return null
+  const N = Number(parts[1])
+  const r = Number(parts[2])
+  const p = Number(parts[3])
+  if (!Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p)) return null
+  // 上界防御：被篡改的哈希文件不得让单次校验吃掉几百 MB 内存（DoS）
+  if (N < 2 || N > 1 << 20 || r < 1 || r > 32 || p < 1 || p > 16) return null
+  const salt = Buffer.from(parts[4], 'base64')
+  const expected = Buffer.from(parts[5], 'base64')
+  if (salt.length === 0 || expected.length === 0 || expected.length > 128) return null
+  return { N, r, p, salt, expected }
+}
+
+/**
+ * 密码校验（异步）：scrypt 交给 libuv 线程池，不阻塞事件循环。
+ * 门卫与 dsh 同进程，同步 scrypt 每 ~40ms 会卡住整个服务（含正在流式输出的对话），
+ * 全局节流只限制了频率（默认 30/分钟 ≈ 1.2s/分钟的累计阻塞）。
+ * 返回布尔；哈希格式非法一律 false，绝不抛。
+ */
+export function verifyPasswordAsync(password, stored) {
+  const parsed = parseHash(stored)
+  if (!parsed) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    try {
+      scrypt(String(password), parsed.salt, parsed.expected.length, { N: parsed.N, r: parsed.r, p: parsed.p }, (err, actual) => {
+        if (err || !actual) return resolve(false)
+        try {
+          resolve(actual.length === parsed.expected.length && timingSafeEqual(actual, parsed.expected))
+        } catch {
+          resolve(false)
+        }
+      })
+    } catch {
+      resolve(false)
+    }
+  })
+}
+
 /**
  * 全局认证计算节流：滑动窗口内限制「触发 scrypt 计算的请求数」。
  * 目的：即使攻击者轮换 IP+用户名绕开双维度锁定，也无法把门卫 CPU 打满
@@ -94,13 +143,9 @@ export class GlobalAuthThrottle {
 // 抹平「账号存在与否」的响应时序差，防止用户名枚举。
 const DUMMY_HASH = hashPassword('dsh-login-gateway-dummy-verify')
 
-/** 假校验：仅消耗等价 CPU 时间，结果无意义。 */
-export function fakeVerify(password) {
-  try {
-    verifyPassword(password, DUMMY_HASH)
-  } catch {
-    /* 忽略 */
-  }
+/** 假校验（异步）：仅消耗等价计算时间，结果无意义。 */
+export function fakeVerifyAsync(password) {
+  return verifyPasswordAsync(password, DUMMY_HASH).then(() => undefined)
 }
 
 /**

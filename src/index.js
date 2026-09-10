@@ -17,7 +17,7 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-import { asString, checkNewPassword, fakeVerify, GlobalAuthThrottle, hashPassword, LoginLimiter, normalizeIp, safeEqualStr, SessionStore, uaBindKey, verifyPassword } from './auth.js'
+import { asString, checkNewPassword, fakeVerifyAsync, GlobalAuthThrottle, hashPassword, LoginLimiter, normalizeIp, safeEqualStr, SessionStore, uaBindKey, verifyPasswordAsync } from './auth.js'
 import { dshAuthCookieName, nativeOpenAvailable, proxyRequest, proxyUpgrade } from './proxy.js'
 import { defaultSettingsFilePath, settingsFilePayload } from './settings-file.js'
 import { loadUsersSync, saveUsersSync } from './user-store.js'
@@ -360,8 +360,8 @@ export function apply(ctx, config = {}) {
     }
     if (authThrottled(req, res, 'login')) return
     const user = users.find((u) => u.username === username)
-    if (!user || !verifyPassword(password, user.passwordHash)) {
-      if (!user) fakeVerify(password) // 反枚举：不存在也消耗等价计算
+    if (!user || !(await verifyPasswordAsync(password, user.passwordHash))) {
+      if (!user) await fakeVerifyAsync(password) // 反枚举：不存在也消耗等价计算
       const remaining = limiter.recordFailure(ip, usernameKey)
       const lock = limiter.lockedBy(ip, usernameKey)
       if (lock) {
@@ -436,7 +436,7 @@ export function apply(ctx, config = {}) {
     const newPassword = asString(body.newPassword)
     const newPassword2 = asString(body.newPassword2)
     const user = users.find((u) => u.username === session.username)
-    if (!user || !verifyPassword(oldPassword, user.passwordHash)) {
+    if (!user || !(await verifyPasswordAsync(oldPassword, user.passwordHash))) {
       const remaining = changePwLimiter.recordFailure(ip, usernameKey)
       const lock = changePwLimiter.lockedBy(ip, usernameKey)
       if (lock) {

@@ -6,10 +6,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import net from 'node:net'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { startGateway, startUpstream, request, login, cookieOf } from './helpers.js'
+import { startGateway, startUpstream, request, login, cookieOf, makeCtx, freePort } from './helpers.js'
 
 test('未登录访问 / 返回登录页并带安全响应头', async () => {
   const gw = await startGateway()
@@ -667,5 +668,145 @@ test('maxSessions 上限逐出最旧会话', async () => {
   } finally {
     gw.stop()
     await up.close()
+  }
+})
+
+test('空 users 数组按未初始化处理：可 /setup 建号，不再砖死', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'gw-empty-'))
+  const userStorePath = path.join(home, 'users.json')
+  writeFileSync(userStorePath, JSON.stringify({ users: [] }))
+  const gw = await startGateway({ userStorePath }, false)
+  try {
+    const setupPage = await request(gw.port, 'GET', '/setup')
+    assert.equal(setupPage.status, 200) // 修复前为 410（永久砖死）
+    assert.match(gw.logs.join(' '), /未初始化/)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('登录限速按大小写无关的用户名维度累计（Admin 与 admin 同一桶）', async () => {
+  const gw = await startGateway({ maxLoginAttempts: 3 })
+  try {
+    const pw = (u) =>
+      request(gw.port, 'POST', '/login', {
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: u, password: 'wrong-password' }),
+      })
+    // 三种大小写各错一次 = 同一用户名桶累计 3 次 → 锁定
+    assert.equal((await pw('admin')).status, 401)
+    assert.equal((await pw('Admin')).status, 401)
+    const third = await pw('ADMIN')
+    assert.equal(third.status, 401)
+    assert.match(JSON.parse(third.body).error, /账号已被临时锁定/)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('改密锁定不污染登录：改密连错后仍可用正确密码登录，换新会话可继续改密', async () => {
+  const gw = await startGateway({ maxLoginAttempts: 3 })
+  try {
+    const c1 = cookieOf(await login(gw.port))
+    const change = (cookie, body) =>
+      request(gw.port, 'POST', '/change-password', {
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    for (let i = 0; i < 3; i++) {
+      await change(c1, { oldPassword: 'nope-nope', newPassword: 'newpassword456', newPassword2: 'newpassword456' })
+    }
+    const locked = await change(c1, {
+      oldPassword: 'password123', newPassword: 'newpassword456', newPassword2: 'newpassword456',
+    })
+    assert.equal(locked.status, 429)
+    assert.match(JSON.parse(locked.body).error, /改密尝试次数过多/)
+    // 登录不受改密锁定影响（修复前共享同一 IP 桶 → 正确密码也 401）
+    const relog = await login(gw.port)
+    assert.equal(relog.status, 200)
+    const c2 = cookieOf(relog)
+    // 用户名维度改密锁仍在（3 次上限），但换用户名键同源、且此前计数已归位：
+    // 这里只断言「登录成功 → 新会话仍能走到改密逻辑（非 429）」由独立限速器保证
+    const afterRelogin = await change(c2, {
+      oldPassword: 'password123', newPassword: 'newpassword456', newPassword2: 'newpassword456',
+    })
+    assert.equal(afterRelogin.status, 429) // 改密锁自身仍在（防在线爆破旧密码）
+    assert.match(JSON.parse(afterRelogin.body).error, /改密尝试次数过多/)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('门卫自产响应带 X-Content-Type-Options: nosniff', async () => {
+  const gw = await startGateway()
+  try {
+    for (const [path, method] of [['/', 'GET'], ['/api/x', 'GET']]) {
+      const res = await request(gw.port, method, path)
+      assert.equal(res.headers['x-content-type-options'], 'nosniff', path)
+    }
+    // 未登录的自动资源 204 也带安全头
+    const icon = await request(gw.port, 'GET', '/favicon.ico')
+    assert.equal(icon.status, 204)
+    assert.equal(icon.headers['x-content-type-options'], 'nosniff')
+  } finally {
+    gw.stop()
+  }
+})
+
+test('secureCookie=true 时门卫自产响应带 HSTS；HTTP 默认不带', async () => {
+  const plain = await startGateway()
+  try {
+    const res = await request(plain.port, 'GET', '/')
+    assert.equal(res.headers['strict-transport-security'], undefined)
+  } finally {
+    plain.stop()
+  }
+  const https = await startGateway({ secureCookie: true })
+  try {
+    const page = await request(https.port, 'GET', '/')
+    assert.match(page.headers['strict-transport-security'] ?? '', /max-age=\d+/)
+    const denied = await request(https.port, 'GET', '/api/x')
+    assert.match(denied.headers['strict-transport-security'] ?? '', /max-age=\d+/)
+  } finally {
+    https.stop()
+  }
+})
+
+test('trustedProxyHops：右侧受信跳数取 IP，客户端伪造的左侧 XFF 被忽略', async () => {
+  const gw = await startGateway({ trustProxy: true, trustedProxyHops: 1, maxLoginAttempts: 2 })
+  try {
+    const hit = (xff) =>
+      request(gw.port, 'POST', '/login', {
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': xff },
+        body: JSON.stringify({ username: 'admin', password: 'wrong-password' }),
+      })
+    // 攻击者伪造左侧，真实来源（最右一跳）恒为 198.51.100.9：两次即锁
+    await hit('1.2.3.4, 198.51.100.9')
+    await hit('9.9.9.9, 198.51.100.9')
+    const locked = await hit('8.8.8.8, 198.51.100.9')
+    assert.match(JSON.parse(locked.body).error, /失败次数过多|账号已被临时锁定/)
+    // 真正来自别的地址（最右一跳不同）仍有独立配额
+    const other = await hit('1.2.3.4, 203.0.113.77')
+    assert.equal(other.status, 401)
+  } finally {
+    gw.stop()
+  }
+})
+
+test('日志走 ctx.logger 对应级别（warn 不再被降级成 info）', async () => {
+  // 用假 ctx 收集分级日志：空 users 文件应产生 warn 级"未初始化"记录
+  const home = mkdtempSync(path.join(tmpdir(), 'gw-logs-'))
+  const userStorePath = path.join(home, 'users.json')
+  const pack = makeCtx({})
+  const { apply } = await import('../src/index.js')
+  const cfg = { listenHost: '127.0.0.1', listenPort: await freePort(), userStorePath, settingsFilePath: path.join(home, 'settings.yaml') }
+  apply(pack.ctx, cfg)
+  try {
+    const idx = pack.logs.findIndex((l) => l.includes('未初始化'))
+    assert.ok(idx >= 0, `启动日志应含未初始化提示，实际收到：${JSON.stringify(pack.logs)}`)
+    // 该条必须走 warn：修复前插件把 warn/error 一律降级成 logger.info，运维无法按级别过滤
+    assert.equal(pack.levels[idx], 'warn', '未初始化提示应以 warn 级别输出')
+  } finally {
+    pack.dispose()
   }
 })

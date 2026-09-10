@@ -27,7 +27,10 @@ export function loadUsersSync(path) {
   if (!data || !Array.isArray(data.users)) {
     throw new Error(`用户文件格式错误（缺少 users 数组）：${path}`)
   }
-  return data.users
+  const users = data.users.filter((u) => u && typeof u.username === 'string' && typeof u.passwordHash === 'string')
+  // 空数组等同"未初始化"：否则 /setup 返回 410、登录永远 401，且没有任何报错，
+  // 只能靠人工删文件恢复（曾把空 users 数组判为已初始化）。
+  return users.length > 0 ? users : null
 }
 
 /**

@@ -41,13 +41,32 @@ const AUTO_RESOURCE_PATHS = new Set([
   '/favicon.ico',
   '/favicon.png',
   '/apple-touch-icon.png',
+  '/apple-touch-icon-precomposed.png',
   '/robots.txt',
 ])
+
+/**
+ * 自动静态资源判定：精确名之外，再放行常见的图标/清单前缀
+ * （PWA 安装时浏览器会按 manifest 里的 icons 路径直接请求，如 /icons/xxx.png）。
+ * 这些路径一律由门卫返回空响应，绝不反代真实 dsh 资源。
+ */
+function isAutoResource(pathname) {
+  if (AUTO_RESOURCE_PATHS.has(pathname)) return true
+  return pathname.startsWith('/icons/') || pathname.startsWith('/assets/icons/')
+}
 
 /** 取插件日志器；脱离 cordis 环境（直接运行/测试）时退回 console。 */
 function getLog(ctx) {
   const logger = ctx?.logger ? ctx.logger('login-gateway') : null
-  return logger?.info ? (...args) => logger.info(...args) : (...args) => console.log('[login-gateway]', ...args)
+  return (message, level = 'info') => {
+    const fn = typeof logger?.[level] === 'function' ? logger[level].bind(logger) : null
+    if (fn) return fn(message)
+    // 脱离 cordis（直接运行/测试）时退回 console：审计日志走 stderr，
+    // 不污染 stdout（dsh 的 stdout 是 Web UI 前端日志通道）。
+    if (level === 'warn') console.warn('[login-gateway]', message)
+    else if (level === 'error' || level === 'fatal') console.error('[login-gateway]', message)
+    else console.log('[login-gateway]', message)
+  }
 }
 
 function parseCookies(header) {
@@ -85,7 +104,15 @@ function sendSecurityHeaders(res) {
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Referrer-Policy', 'no-referrer')
   res.setHeader('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+  // 按 content-type 声明，浏览器不做 MIME 嗅探
+  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Cache-Control', 'no-store')
+  // HTTPS 部署补 HSTS：让浏览器后续直接走 https，压缩 SSL Strip 与首跳明文窗口。
+  // 明文部署绝不发 HSTS（发了会把 http 入口彻底锁死）。开关挂在 server 实例上，
+  // 避免模块级状态在同进程多实例（测试）间串味。
+  if (res?.socket?.server?.__dshGatewayHsts === true) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000')
+  }
 }
 
 function sendJson(res, status, data) {
@@ -201,6 +228,9 @@ export function apply(ctx, config = {}) {
     // 前置 TLS 反代（nginx/caddy）场景设 true：从 X-Forwarded-For 取真实客户端 IP，
     // 让限速按真实来源生效。直连场景必须保持 false，否则攻击者可伪造 XFF 绕过限速。
     trustProxy: config.trustProxy ?? false,
+    // 仅 trustProxy=true 时有意义：可信代理链长度，取 XFF 右起第 N 段作为客户端 IP。
+    // 直连客户端只能往 XFF 左侧追加，伪造不到右起位置（fix 前取首段，可被伪造绕过限速）。
+    trustedProxyHops: config.trustedProxyHops ?? 1,
     // Cookie Secure 标记：未显式配置时跟随 tls.enabled（HTTPS 下自动开启）
     secureCookie: config.secureCookie ?? Boolean(config.tls?.enabled),
     // 会话容量上限：防止反复登录刷爆内存
@@ -218,25 +248,41 @@ export function apply(ctx, config = {}) {
   // config.users 种子机制已废弃（会造成"默认用户"）：配置里仍有 users 字段时忽略，不报错。
   // 新装一律强制走 /setup 引导创建账号；本地无用户数据 = 未初始化。
   const log = getLog(ctx)
-  // 宿主浏览器鉴权参数惰性解析：connection 服务可能晚于本插件挂载，首次取不到
-  // 则下次请求再试；一旦取到即缓存（启动令牌与门卫同属一个 dsh 进程，进程内不变）。
+  /**
+   * 惰性解析宿主鉴权参数：resolved 为 null 表示本次还没解析出来（connection 服务
+   * 尚未挂载），必须留待后续请求重试；只有真值才落地缓存。
+   * 早期实现把 null 也当成"已解析"缓存住，导致 connection 挂载晚于首请求时
+   * 令牌交换在本进程内永久失效（实测：首请求时服务未挂载 → 之后所有首页导航都 401）。
+   */
   let dshAuthCache
-  const getDshAuth = () => (dshAuthCache === undefined ? (dshAuthCache = resolveDshAuth(ctx, cfg)) : dshAuthCache)
+  const getDshAuth = () => {
+    if (dshAuthCache !== undefined) return dshAuthCache
+    const resolved = resolveDshAuth(ctx, cfg)
+    if (resolved) dshAuthCache = resolved
+    return resolved
+  }
   const sessions = new SessionStore(cfg.sessionTtlHours * 3600_000, cfg.maxSessions)
   const limiter = new LoginLimiter(cfg.maxLoginAttempts, cfg.lockMinutes * 60_000)
   const setupLimiter = new LoginLimiter(cfg.setupMaxAttempts, cfg.setupLockMinutes * 60_000)
+  const changePwLimiter = new LoginLimiter(cfg.maxLoginAttempts, cfg.lockMinutes * 60_000)
   const authThrottle = new GlobalAuthThrottle(cfg.globalAuthRatePerMinute)
   let users = null
   let initialized = false
   let setupToken = null
 
-  /** 客户端来源 IP：trustProxy 时取 XFF 首段（前置 TLS 反代场景），否则直连 socket 地址。 */
+  /**
+   * 客户端来源 IP：trustProxy 时取 XFF 右起第 trustedProxyHops 段（前置反代会把
+   * 直连对端追加在右侧，左侧内容客户端可随意伪造），否则用直连 socket 地址。
+   */
   function getClientIp(req) {
     if (cfg.trustProxy) {
       const xff = req.headers['x-forwarded-for']
       if (typeof xff === 'string' && xff.length > 0) {
-        const first = xff.split(',')[0].trim()
-        if (first) return first.slice(0, 128)
+        const parts = xff.split(',').map((s) => s.trim()).filter(Boolean)
+        if (parts.length > 0) {
+          const hops = Math.min(Math.max(1, cfg.trustedProxyHops), parts.length)
+          return parts[parts.length - hops].slice(0, 128)
+        }
       }
     }
     return req.socket.remoteAddress ?? 'unknown'
@@ -279,12 +325,14 @@ export function apply(ctx, config = {}) {
     initialized = true
     removeSetupToken(cfg.userStorePath, log)
     log(`已从用户文件加载 ${users.length} 个用户`)
+    if (users.length === 0) log(`用户文件不含任何账号（${cfg.userStorePath}），按未初始化处理`, 'warn')
   } else {
     setupToken = randomBytes(16).toString('hex').toUpperCase().replace(/(.{4})(?=.)/g, '$1-')
     // 三通道输出，确保令牌可见：console 直出 stdout + ctx.logger + 写入文件（0600）
     const tokenMsg = `登录门卫未初始化，请访问 http://<主机>:${cfg.listenPort}/setup 并输入一次性令牌：${setupToken}`
+    // 未初始化是需要人工介入的状态：降级成 info 容易被淹没，统一走 warn 级别
     console.log(`[login-gateway] ${tokenMsg}`)
-    log(tokenMsg)
+    log(tokenMsg, 'warn')
     writeSetupToken(cfg.userStorePath, setupToken, log)
   }
 
@@ -369,8 +417,14 @@ export function apply(ctx, config = {}) {
    */
   async function handleChangePassword(req, res, session, currentToken) {
     const ip = getClientIp(req)
-    if (limiter.isLocked(ip, session.username.toLowerCase())) {
-      return sendJson(res, 429, { error: `尝试次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
+    // 用户名键统一小写（与 handleLogin 的 usernameKey 同源），否则大小写混用会让
+    // 失败计数写进 'Admin' 而 reset 清 'admin' 清不掉。
+    const usernameKey = session.username.toLowerCase()
+    // 改密用独立限速器：故意不共享登录限速表——共享时用户自己把登录 IP 桶打爆
+    // （改密失败也会+"1"），随后连正确密码登录都被拒；独立后改密连错只锁已登录的
+    // 改密入口，正确密码登录会清空登录桶，登录永远不因改密失误被锁。
+    if (changePwLimiter.isLocked(ip, usernameKey)) {
+      return sendJson(res, 429, { error: `改密尝试次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
     }
     const body = await readJsonBody(req)
     if (body === null) return sendJson(res, 400, { error: '请求体不是有效的 JSON' })
@@ -380,9 +434,14 @@ export function apply(ctx, config = {}) {
     const newPassword2 = String(body.newPassword2 ?? '')
     const user = users.find((u) => u.username === session.username)
     if (!user || !verifyPassword(oldPassword, user.passwordHash)) {
-      const remaining = limiter.recordFailure(ip, session.username.toLowerCase())
+      const remaining = changePwLimiter.recordFailure(ip, usernameKey)
+      const lock = changePwLimiter.lockedBy(ip, usernameKey)
+      if (lock) {
+        log(`改密失败并触发锁定 ip=${clean(ip)} user=${clean(session.username)}`)
+        return sendJson(res, 429, { error: `改密尝试次数过多，已锁定 ${cfg.lockMinutes} 分钟，请稍后再试` })
+      }
       log(`改密失败 ip=${clean(ip)} user=${clean(session.username)} 原因=当前密码错误 剩余=${remaining}`)
-      return sendJson(res, 401, { error: '当前密码不正确' })
+      return sendJson(res, 401, { error: `当前密码不正确，剩余可尝试次数：${remaining}` })
     }
     if (newPassword.length < 8) return sendJson(res, 400, { error: '新密码长度至少 8 位' })
     if (newPassword.length > 1024) return sendJson(res, 400, { error: '新密码过长' })
@@ -403,7 +462,7 @@ export function apply(ctx, config = {}) {
         revoked += 1
       }
     }
-    limiter.reset(ip, session.username)
+    changePwLimiter.reset(ip, usernameKey)
     log(`改密成功 ip=${clean(ip)} user=${clean(session.username)} 吊销其他会话 ${revoked} 个`)
     return sendJson(res, 200, { ok: true, revoked })
   }
@@ -457,7 +516,7 @@ export function apply(ctx, config = {}) {
       // manifest 必须返回合法 JSON（空响应会让浏览器报 "Manifest: Syntax error"），
       // 用极简中性内容占位；robots.txt 明确 Disallow 防搜索引擎收录登录页。
       // 仅放行幂等的 GET/HEAD，其余方法一律拒绝。
-      if ((req.method === 'GET' || req.method === 'HEAD') && AUTO_RESOURCE_PATHS.has(pathname)) {
+      if ((req.method === 'GET' || req.method === 'HEAD') && isAutoResource(pathname)) {
         if (pathname === '/robots.txt') return sendText(res, 200, 'User-agent: *\nDisallow: /\n')
         if (pathname === '/manifest.webmanifest') {
           sendSecurityHeaders(res)
@@ -465,12 +524,16 @@ export function apply(ctx, config = {}) {
           res.end('{"name":"Service","short_name":"Service","start_url":"/","scope":"/","display":"standalone","icons":[]}')
           return
         }
+        sendSecurityHeaders(res) // 含 nosniff/去指纹头，204 也要带
         res.writeHead(204)
         res.end()
         return
       }
       if (pathname === '/') return sendHtml(res, 200, loginPageHtml)
-      return sendJson(res, 401, { error: '未登录，请先访问 / 登录' })
+      const hint = String(req.headers.accept ?? '').includes('text/html')
+        ? '登录已失效，请刷新页面或重新访问 / 登录'
+        : '未登录，请先访问 / 登录'
+      return sendJson(res, 401, { error: hint })
     }
 
     // 门卫托管的设置文件下载（需登录）：宿主机无桌面环境时 dsh 原生打开必然失败，
@@ -539,6 +602,8 @@ export function apply(ctx, config = {}) {
   // 并发上限 + 收紧超时防 slowloris（Node 默认 headersTimeout 60s 过长）：
   // headersTimeout 15s 内未收全请求头断开；requestTimeout 30s 内未收全请求体断开；
   // keepAliveTimeout 5s 空闲 keep-alive 连接回收，配合 maxConnections 防止连接堆积耗资源。
+  // HTTPS 部署（secureCookie）时所有门卫自产响应补 HSTS
+  if (cfg.secureCookie) server.__dshGatewayHsts = true
   server.maxConnections = cfg.maxConnections
   server.headersTimeout = 15_000
   server.requestTimeout = 30_000
@@ -559,6 +624,7 @@ export function apply(ctx, config = {}) {
     sessions.sweep()
     limiter.sweep()
     setupLimiter.sweep()
+    changePwLimiter.sweep()
   }, SWEEP_INTERVAL)
   sweepTimer.unref?.()
 

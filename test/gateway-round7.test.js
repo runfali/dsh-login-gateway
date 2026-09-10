@@ -5,7 +5,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { startGateway, request, login, cookieOf } from './helpers.js'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+
+import { startGateway, request, login, cookieOf, makeCtx } from './helpers.js'
 
 test('设置文件下载：文件缺失时 404 且错误文案不含绝对路径', async () => {
   const gw = await startGateway({ settingsFileDownload: true })
@@ -51,4 +55,17 @@ test('设置文件下载：非 GET/HEAD 返回 405', async () => {
   } finally {
     gw.stop()
   }
+})
+
+test('apply(ctx, null) 不再抛 TypeError（cordis 可能传 null 配置）', async () => {
+  const { apply } = await import('../src/index.js')
+  const home = mkdtempSync(path.join(tmpdir(), 'gw-nullcfg-'))
+  const pack = makeCtx({})
+  assert.doesNotThrow(() => {
+    apply(pack.ctx, { listenHost: '127.0.0.1', userStorePath: path.join(home, 'users.json'), listenPort: 0 })
+  })
+  pack.dispose()
+  const pack2 = makeCtx({})
+  assert.doesNotThrow(() => apply(pack2.ctx, null))
+  pack2.dispose()
 })

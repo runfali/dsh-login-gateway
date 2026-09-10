@@ -211,43 +211,46 @@ function resolveDshAuth(ctx, cfg) {
 }
 
 export function apply(ctx, config = {}) {
+  // cordis 允许把配置写成 null（profile 里留空或 patch 生成 null）：
+  // 默认参数只兜住 undefined，null 会在这里炸成 TypeError。
+  const raw = config ?? {}
   const cfg = {
-    listenHost: config.listenHost ?? '0.0.0.0',
-    listenPort: config.listenPort ?? 3081,
-    targetHost: config.targetHost ?? '127.0.0.1',
-    targetPort: config.targetPort ?? 3080,
-    sessionTtlHours: config.sessionTtlHours ?? 24,
-    maxLoginAttempts: config.maxLoginAttempts ?? 5,
-    lockMinutes: config.lockMinutes ?? 5,
-    setupMaxAttempts: config.setupMaxAttempts ?? 5,
-    setupLockMinutes: config.setupLockMinutes ?? 30,
-    proxyTimeoutMs: config.proxyTimeoutMs ?? 60_000,
-    streamIdleTimeoutMs: config.streamIdleTimeoutMs ?? 1800_000,
-    maxConnections: config.maxConnections ?? 512,
-    userStorePath: config.userStorePath ?? path.join(os.homedir(), '.dsh-login-gateway', 'users.json'),
-    clientLoopbackTrust: config.clientLoopbackTrust ?? true,
-    settingsFilePath: config.settingsFilePath ?? defaultSettingsFilePath(),
-    settingsFileDownload: config.settingsFileDownload ?? true,
+    listenHost: raw.listenHost ?? '0.0.0.0',
+    listenPort: raw.listenPort ?? 3081,
+    targetHost: raw.targetHost ?? '127.0.0.1',
+    targetPort: raw.targetPort ?? 3080,
+    sessionTtlHours: raw.sessionTtlHours ?? 24,
+    maxLoginAttempts: raw.maxLoginAttempts ?? 5,
+    lockMinutes: raw.lockMinutes ?? 5,
+    setupMaxAttempts: raw.setupMaxAttempts ?? 5,
+    setupLockMinutes: raw.setupLockMinutes ?? 30,
+    proxyTimeoutMs: raw.proxyTimeoutMs ?? 60_000,
+    streamIdleTimeoutMs: raw.streamIdleTimeoutMs ?? 1800_000,
+    maxConnections: raw.maxConnections ?? 512,
+    userStorePath: raw.userStorePath ?? path.join(os.homedir(), '.dsh-login-gateway', 'users.json'),
+    clientLoopbackTrust: raw.clientLoopbackTrust ?? true,
+    settingsFilePath: raw.settingsFilePath ?? defaultSettingsFilePath(),
+    settingsFileDownload: raw.settingsFileDownload ?? true,
     // 前置 TLS 反代（nginx/caddy）场景设 true：从 X-Forwarded-For 取真实客户端 IP，
     // 让限速按真实来源生效。直连场景必须保持 false，否则攻击者可伪造 XFF 绕过限速。
-    trustProxy: config.trustProxy ?? false,
+    trustProxy: raw.trustProxy ?? false,
     // 仅 trustProxy=true 时有意义：可信代理链长度，取 XFF 右起第 N 段作为客户端 IP。
     // 直连客户端只能往 XFF 左侧追加，伪造不到右起位置（fix 前取首段，可被伪造绕过限速）。
-    trustedProxyHops: config.trustedProxyHops ?? 1,
+    trustedProxyHops: raw.trustedProxyHops ?? 1,
     // Cookie Secure 标记：未显式配置时跟随 tls.enabled（HTTPS 下自动开启）
-    secureCookie: config.secureCookie ?? Boolean(config.tls?.enabled),
+    secureCookie: raw.secureCookie ?? Boolean(raw.tls?.enabled),
     // 会话容量上限：防止反复登录刷爆内存
-    maxSessions: config.maxSessions ?? 1000,
+    maxSessions: raw.maxSessions ?? 1000,
     // 全局认证计算节流：每分钟最多允许多少次「触发 scrypt 的尝试」（登录+改密合计），
     // 超限直接 429，不消耗哈希计算——防绕过双维度锁定后打满 CPU
-    globalAuthRatePerMinute: config.globalAuthRatePerMinute ?? 30,
+    globalAuthRatePerMinute: raw.globalAuthRatePerMinute ?? 30,
     // 会话绑定 User-Agent：HTTP 直连场景下被嗅探的 Cookie 在不同客户端上不可复用；
     // 浏览器升级换 UA 后需重新登录。设 false 可关闭。
-    bindUserAgent: config.bindUserAgent ?? true,
+    bindUserAgent: raw.bindUserAgent ?? true,
   }
   // 门卫自身 TLS（可选）：http+ip 直连场景下为密码与会话提供传输加密。
   // 配置错误必须显式失败——静默回退明文会让用户误以为已加密。
-  const tlsCfg = normalizeTlsConfig(config.tls)
+  const tlsCfg = normalizeTlsConfig(raw.tls)
   // config.users 种子机制已废弃（会造成"默认用户"）：配置里仍有 users 字段时忽略，不报错。
   // 新装一律强制走 /setup 引导创建账号；本地无用户数据 = 未初始化。
   const log = getLog(ctx)

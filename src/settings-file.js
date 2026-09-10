@@ -29,8 +29,10 @@ export function settingsFilePayload(filePath) {
   try {
     raw = readFileSync(filePath)
   } catch (err) {
-    if (err.code === 'ENOENT') return { ok: false, status: 404, reason: `配置文件不存在：${filePath}` }
-    return { ok: false, status: 500, reason: `读取配置文件失败：${err?.message ?? err}` }
+    // 对外错误文案不带绝对路径/系统错误原文（避免泄漏服务器目录结构）；
+    // 细节由调用方记进日志。
+    if (err.code === 'ENOENT') return { ok: false, status: 404, reason: '配置文件不存在', detail: filePath }
+    return { ok: false, status: 500, reason: '读取配置文件失败', detail: `${filePath}: ${err?.message ?? err}` }
   }
   const header = Buffer.from(`# dsh settings file: ${filePath}\n# via dsh-login-gateway (browser download)\n\n`, 'utf8')
   return {

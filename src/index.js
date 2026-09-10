@@ -550,9 +550,18 @@ export function apply(ctx, config = {}) {
       return handleChangePassword(req, res, session, cookies[COOKIE_NAME])
     }
     if (cfg.settingsFileDownload && pathname === '/__gateway/settings.yaml') {
-      if (req.method !== 'GET') return sendText(res, 405, '仅支持 GET')
+      if (req.method !== 'GET' && req.method !== 'HEAD') return sendText(res, 405, '仅支持 GET / HEAD')
       const payload = settingsFilePayload(cfg.settingsFilePath)
-      if (!payload.ok) return sendJson(res, payload.status, { error: payload.reason })
+      if (!payload.ok) {
+        log(`设置文件下载失败：${payload.detail ?? payload.reason}`, payload.status >= 500 ? 'error' : 'warn')
+        return sendJson(res, payload.status, { error: payload.reason })
+      }
+      if (req.method === 'HEAD') {
+        sendSecurityHeaders(res)
+        const { 'content-length': _len, ...headOnly } = payload.headers
+        res.writeHead(payload.status, headOnly)
+        return res.end()
+      }
       sendSecurityHeaders(res)
       res.writeHead(payload.status, payload.headers)
       res.end(payload.body)

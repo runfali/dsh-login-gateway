@@ -55,6 +55,23 @@ export function rewriteHeaders(headers, targetHost, targetPort, { trustProxy = f
   return out
 }
 
+/**
+ * 请求行规范化：一律转成 origin-form（path + query）。
+ *
+ * 客户端/代理可能发来绝对形式（`GET http://evil.example.com/api/x HTTP/1.1`）或
+ * 网络路径形式（`GET //evil.example.com/api/x`）。原样透传会让上游按请求行里的
+ * authority 解析（Host 已被门卫改写为 loopback，两者不一致 → origin 混淆/缓存投毒）。
+ * 解析失败返回 '/'，绝不把可疑请求原样送进上游。
+ */
+export function originFormPath(url) {
+  try {
+    const u = new URL(url ?? '/', 'http://gateway.invalid')
+    return `${u.pathname}${u.search}`
+  } catch {
+    return '/'
+  }
+}
+
 /** 剔除响应里的逐跳头（Node 会自动处理 chunked）。 */
 function stripHopByHop(headers) {
   const out = { ...headers }
@@ -375,7 +392,9 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
   // 门卫在「已登录用户的首页导航」上代跑令牌交换：宿主回 303 + Set-Cookie，
   // 原样透传给浏览器保存，之后所有 /api 与 WS 请求自带会话。
   // 令牌只出现在门卫→宿主这一跳的请求行上，不进入任何下发给浏览器的内容。
-  let path = req.url
+  // 请求行规范化：上游只接受 path+query，绝对形式/网络路径形式一律折叠成 origin-form
+  const originPath = originFormPath(req.url)
+  let path = originPath
   let retryOn401 = false
   if (dshAuth && isIndexNavigation(req)) {
     if (hasCookieNamed(headers.cookie, dshAuth.cookieName)) {
@@ -383,7 +402,7 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
       // 时剥掉它重跑一次交换，避免远端用户被 401 墙困住只能清 Cookie。
       retryOn401 = true
     } else {
-      path = withLaunchToken(req.url, dshAuth.token)
+      path = withLaunchToken(originPath, dshAuth.token)
     }
   }
   attempt(path, headers, retryOn401)
@@ -400,7 +419,7 @@ export function proxyRequest(req, res, targetHost, targetPort, proxyTimeoutMs = 
       if (mayRetry && upRes.statusCode === 401) {
         upRes.resume() // 丢弃宿主 401 正文，改走令牌交换
         attempt(
-          withLaunchToken(req.url, dshAuth.token),
+          withLaunchToken(originPath, dshAuth.token),
           { ...attemptHeaders, cookie: withoutCookie(attemptHeaders.cookie, dshAuth.cookieName) },
           false,
         )
@@ -525,7 +544,8 @@ export function proxyUpgrade(req, socket, head, targetHost, targetPort, proxyTim
     host: targetHost,
     port: targetPort,
     method: 'GET',
-    path: req.url,
+    // WS 握手同样只送 origin-form
+    path: originFormPath(req.url),
     headers,
     agent: false,
   })

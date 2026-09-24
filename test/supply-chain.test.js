@@ -47,11 +47,17 @@ test('禁止安装脚本：package.json 不得声明任何 npm 生命周期钩�
   assert.deepEqual(unexpected, [], `未在允许清单内的 scripts：${unexpected.join(', ')}（新增前请确认它不在安装期执行）`)
 })
 
-test('零运行时依赖：dependencies / optionalDependencies / peerDependencies 必须为空', () => {
+test('零运行时依赖：不得有 dependencies/optionalDependencies；peerDependencies 只允许 @deepseek-ai/dsh 兼容声明', () => {
+  // 0.1.7 起 dsh 在安装期与启动期都会用 peerDependencies 做兼容校验（安装 preflight +
+  // 启动 preflight 均只认 @deepseek-ai/dsh* 的 peer），因此兼容区间必须走 peerDependencies。
   assert.equal(pkg.dependencies ?? undefined, undefined, '不得有 dependencies')
   assert.equal(pkg.optionalDependencies ?? undefined, undefined, '不得有 optionalDependencies')
-  assert.equal(pkg.peerDependencies ?? undefined, undefined, '不得有 peerDependencies（宿主服务用 ctx.inject 声明）')
   assert.equal(pkg.bundleDependencies ?? undefined, undefined)
+  const peers = pkg.peerDependencies ?? {}
+  const keys = Object.keys(peers)
+  assert.deepEqual(keys, ['@deepseek-ai/dsh'], 'peerDependencies 只允许声明 @deepseek-ai/dsh 的兼容区间')
+  assert.equal(typeof peers['@deepseek-ai/dsh'], 'string')
+  // 运行时零依赖的本质不变：peer 只是兼容声明，不会带来任何被 require 的第三方包
 })
 
 test('禁止 gyp / 原生扩展：无 binding.gyp、无 .node 产物、无 node-gyp 依赖', () => {
@@ -60,7 +66,7 @@ test('禁止 gyp / 原生扩展：无 binding.gyp、无 .node 产物、无 node-
   const offenders = files.filter((f) => /(^|\/)binding\.gyp$|\.node$|\.gyp$|\.dll$|\.so$/.test(f))
   assert.deepEqual(offenders.map((f) => path.relative(root, f)), [], '存在原生扩展或 gyp 配置')
   // 源码里不得出现原生加载 / 构建期调用
-  const srcFiles = files.filter((f) => /\.(js|mjs|cjs|json|ya?ml)$/.test(f) && !f.includes('/test/'))
+  const srcFiles = files.filter((f) => /\.(js|mjs|cjs|json|ya?ml)$/.test(f) && !f.includes(`${path.sep}test${path.sep}`))
   const bad = []
   for (const f of srcFiles) {
     const text = readFileSync(f, 'utf8')
@@ -159,8 +165,10 @@ test('版本与兼容声明一致：engines 区间必须覆盖本仓库当前版
   assert.ok(satisfied, `本仓库版本 ${version} 不被自己声明的 engines 区间「${range}」覆盖`)
 })
 
-test('engines 必须显式覆盖 0.1.5 预发布段（本仓的目标 dsh 版本）', () => {
+test('engines 必须显式覆盖 0.1.5 与 0.1.7 预发布段（本仓的目标 dsh 版本）', () => {
   const range = pkg.dsh?.engines?.dsh ?? ''
-  // 只要区间里出现 >=0.1.5-alpha.x 或 >=0.1.5-rc.x，即认为覆盖（配合上一条的通用判定）
+  // dsh 侧用 includePrerelease:true 判定；pnpm 安装期则是严格 semver——预发布版本
+  // 必须有同元组预发布下界，所以 0.1.5-rc.* 与 0.1.7-rc.* 各需要自己的 clause。
   assert.match(range, />=\s*0\.1\.5-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.1.5 预发布下界')
+  assert.match(range, />=\s*0\.1\.7-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.1.7 预发布下界')
 })

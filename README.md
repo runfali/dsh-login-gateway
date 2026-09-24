@@ -250,21 +250,22 @@ rm -rf ~/.dsh-login-gateway/
 
 ## 版本兼容
 
-插件在 `package.json` 中声明了 `dsh.engines.dsh`（`>=0.1.2-alpha.3 <0.2.0 || >=0.1.5-alpha.1 <0.1.6`）
-与 `engines.node`（`^22.19.0 || >=24.0.0`）——注意这是**语义声明**而非宿主强制校验
-（0.1.2/0.1.5 全树均无该字段的消费者），作用是标记已验证的 dsh 范围。
+插件在 `package.json` 中声明了 `dsh.engines.dsh` 与 `peerDependencies["@deepseek-ai/dsh"]`
+（均为 `>=0.1.2-alpha.3 <0.1.8 || >=0.1.5-alpha.1 <0.1.6 || >=0.1.7-alpha.0 <0.1.8`）
+与 `engines.node`（`^22.19.0 || >=24.0.0`）。
 
-> 为什么要写成两段：npm semver 的预发布规则——`>=0.1.2-alpha.3 <0.2.0` 这类区间
-> **只有在区间内出现同元组预发布时才对预发布版生效**，因此 `0.1.5-alpha.1`/`0.1.5-rc.1`
-> **不满足**该区间（`0.1.5` 正式版才满足）。补上 `>=0.1.5-alpha.1 <0.1.6` 后，
-> `0.1.5-alpha.1`~`0.1.5` 整段（含 rc）都在声明范围内；上界 `<0.1.6` 让未来的
-> `0.1.6-*` 必须先验证再放行。
+> **0.1.7 起声明不再是纯语义**：dsh 在安装期（插件管理器 preflight）与启动期（profile
+> preflight）都会用 `peerDependencies` 对运行时版本做兼容校验（`includePrerelease: true`），
+> 不匹配的插件会被拒绝安装或拒绝挂载。宿主侧判定带 `includePrerelease`，而 pnpm 安装期
+> 是严格 semver——预发布版必须有**同元组**预发布下界才被满足，所以 0.1.5-`rc.*` 与
+> 0.1.7-`rc.*` 各有自己的 clause。上界 `<0.1.8` 让未来的 `0.1.8-*` 必须先验证再放行。
 
 | dsh | 状态 |
 | --- | --- |
 | `0.1.0-rc.*` / `0.1.1-rc.*` | ✅ 正常工作（无宿主浏览器鉴权，适配逻辑整体跳过） |
 | `0.1.2-alpha.1` ~ `0.1.2-rc.1` | ✅ 需要本仓库 ≥ 0.3.0；0.2.0 及更早的门卫版本登录后首页与全部 `/api` 一律 401 |
-| `0.1.5-alpha.1` ~ `0.1.5-rc.1` | ✅ **当前发布版本**（本仓库版本号同为 `0.1.5-rc.1`）；已逐包核对 + 真机端到端实测（见下），无需改门卫配置 |
+| `0.1.5-alpha.1` ~ `0.1.5-rc.1` | ✅ 已逐包核对 + 真机端到端实测（见下），无需改门卫配置 |
+| `0.1.7-rc.1` | ✅ **当前发布版本**（本仓库版本号同为 `0.1.7-rc.1`）；已逐包核对 + 回归固化（见下） |
 
 升级 dsh 后无需改动门卫配置：令牌交换由门卫自动完成，浏览器首次访问首页时静默换取宿主会话。
 
@@ -289,6 +290,32 @@ rm -rf ~/.dsh-login-gateway/
   （拿到 `dsh-auth-*` 宿主 Cookie）再升级 WS——这正是真实浏览器的顺序（页面加载先走 `/`）。
   只带门卫会话、没走首页就直连 WS 会得到 `401`（宿主侧拒），属预期行为，不是缺陷。
 - **对照实验**：同一 WS 请求直连宿主被 `403` 拒 —— 证明门卫改写三头仍是必需的。
+
+### dsh 0.1.7-rc.1 适配结论
+
+对 0.1.7-rc.1 做了逐包源码比对（本机安装实例），要点：
+
+- **令牌交换契约零漂移**：`token` 查询参数、`dsh-auth-<sha256(authority)>` Cookie 名、
+  `303` 交换响应、Cookie 属性（无 `Secure`）、401 文案与 0.1.5 逐字一致；
+  门卫的代跑交换、401 自愈、登出连带吊销三条链无需改动（`test/host-auth-017.test.js` 固化）。
+- **信任围栏形状未变**（Host loopback/trusted → `sec-fetch-site` 拒 cross-site → Origin 同权威），
+  门卫"改写三头"方案依旧必需。
+- **兼容校验升级为强制**：0.1.7 起 `peerDependencies` 在安装 preflight（插件管理器）与启动
+  preflight（profile 兼容检查）两处被消费，不再只是家族约定。本仓已声明
+  `peerDependencies["@deepseek-ai/dsh"]`（三 clause 区间，同时满足 dsh 侧
+  `includePrerelease: true` 与 pnpm 严格 semver 两套判定）。
+- **宿主服务 `settingsScope` 已移除**：0.1.7 的 `dsh-client-ui-settings` 改为
+  `configForms` 服务（同样持有 `persistence` + `mirror` 两个同名字段，
+  `SettingsDescribeMirror` 形状不变：store 快照 `{status, view, error}`、
+  `getSnapshot/load` 同名）。client bundle 的兜底修复现在**同时尝试两个服务名**，
+  新旧宿主都能命中。
+- **`dsh.client.inject` 约定确认**：该字段是模块图依赖（包名），与 bundle 代码里的
+  `exports.inject`（cordis 服务名）是两套机制；本仓两者均已符合 0.1.7 约定
+  （inject `@deepseek-ai/dsh-client-connection` + exports.inject `["connection"]`）。
+- **0.1.7 的 HMR/热加载与本插件兼容**：门卫随 profile patch 生命周期挂载/卸载
+  （`hmr watchConfig` 监听 patch 文件与 profile manifest 变化触发 reconcile），无需额外适配。
+
+测试：`pnpm test`（124 例全绿，其中 `test/host-auth-017.test.js` 8 例为 0.1.7 形状回归）。
 
 ## 供应链约束（无安装脚本 / 无 gyp / 预编译随包）
 

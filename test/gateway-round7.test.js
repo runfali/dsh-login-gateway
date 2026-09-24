@@ -9,6 +9,8 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { fileURLToPath } from 'node:url'
+
 import { startGateway, request, login, cookieOf, makeCtx } from './helpers.js'
 
 test('设置文件下载：文件缺失时 404 且错误文案不含绝对路径', async () => {
@@ -28,7 +30,7 @@ test('设置文件下载：文件缺失时 404 且错误文案不含绝对路径
 })
 
 test('设置文件下载：HEAD 仅回响应头，GET 仍下附件', async () => {
-  const gw = await startGateway({ settingsFileDownload: true, settingsFilePath: new URL('./fixtures-settings.yaml', import.meta.url).pathname })
+  const gw = await startGateway({ settingsFileDownload: true, settingsFilePath: fileURLToPath(new URL('./fixtures-settings.yaml', import.meta.url)) })
   try {
     const jar = cookieOf(await login(gw.port))
     const head = await request(gw.port, 'HEAD', '/__gateway/settings.yaml', { headers: { cookie: jar } })

@@ -5,6 +5,9 @@
 #   dsh plugin --profile web remove dsh-login-gateway
 # 安装/卸载后重启 dsh 生效。
 #
+# 0.1.7 起 dsh 在安装期/启动期用 peerDependencies 校验插件与宿主版本的兼容性，
+# 不匹配会被拒绝安装（安装 preflight）或拒绝挂载（启动 preflight）。
+#
 # 本层只提供默认配置；个性化覆盖（改端口、超时等）请写在 profile 目录
 # （如 ~/.dsh/profiles/web/）的 cordis.patch.yml 用户层里，用
 # `- id: login-gateway` 覆盖（注意：补丁是整段替换 config，覆盖时要写全所有项）。

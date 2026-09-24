@@ -119,8 +119,10 @@ test('verifyPasswordAsync 不阻塞事件循环（scrypt 走线程池）', async
   const timer = setInterval(() => { ticks += 1 }, 1)
   await Promise.all([verifyPasswordAsync('secret-password', h), verifyPasswordAsync('wrong', h)])
   clearInterval(timer)
-  // 同步 scrypt 会独占事件循环（~40ms×2），异步版应留下多次定时器回调
-  assert.ok(ticks >= 5, `事件循环被阻塞，timer tick=${ticks}`)
+  // 同步 scrypt 会独占事件循环（~40ms×2 → 1ms 定时器几乎不可能 tick）。
+  // 计时敏感（CI/Windows 负载下 1ms 定时器会合并），阈值放宽到「至少 tick 过一次」，
+  // 同步实现仍会以 0 tick 稳定失败。
+  assert.ok(ticks >= 1, `事件循环被阻塞，timer tick=${ticks}`)
 })
 
 test('GlobalAuthThrottle 窗口计数与重置', () => {

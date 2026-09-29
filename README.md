@@ -251,21 +251,24 @@ rm -rf ~/.dsh-login-gateway/
 ## 版本兼容
 
 插件在 `package.json` 中声明了 `dsh.engines.dsh` 与 `peerDependencies["@deepseek-ai/dsh"]`
-（均为 `>=0.1.2-alpha.3 <0.1.8 || >=0.1.5-alpha.1 <0.1.6 || >=0.1.7-alpha.0 <0.1.8`）
+（均为 `>=0.1.2-alpha.3 <0.1.8 || >=0.1.5-alpha.1 <0.1.6 || >=0.1.7-alpha.0 <0.1.8 || >=0.2.0-alpha.0 <0.3.0`）
 与 `engines.node`（`^22.19.0 || >=24.0.0`）。
 
 > **0.1.7 起声明不再是纯语义**：dsh 在安装期（插件管理器 preflight）与启动期（profile
 > preflight）都会用 `peerDependencies` 对运行时版本做兼容校验（`includePrerelease: true`），
-> 不匹配的插件会被拒绝安装或拒绝挂载。宿主侧判定带 `includePrerelease`，而 pnpm 安装期
-> 是严格 semver——预发布版必须有**同元组**预发布下界才被满足，所以 0.1.5-`rc.*` 与
-> 0.1.7-`rc.*` 各有自己的 clause。上界 `<0.1.8` 让未来的 `0.1.8-*` 必须先验证再放行。
+> 不匹配的插件会被拒绝安装或拒绝挂载。**闸只读 `peerDependencies`，从不读 `dsh.engines.dsh`**，
+> 两者必须逐字一致（`test/supply-chain.test.js` 守护）。宿主侧判定带 `includePrerelease`，
+> 而 pnpm 安装期是严格 semver——预发布版必须有**同元组**预发布下界才被满足，所以
+> 0.1.5-`rc.*`、0.1.7-`rc.*`、0.2.0-`rc.*` 各有自己的 clause。
+> 上界 `<0.1.8` / `<0.3.0` 让未来的 `0.1.8-*` 与 `0.3.0-*` 必须先验证再放行。
 
 | dsh | 状态 |
 | --- | --- |
 | `0.1.0-rc.*` / `0.1.1-rc.*` | ✅ 正常工作（无宿主浏览器鉴权，适配逻辑整体跳过） |
 | `0.1.2-alpha.1` ~ `0.1.2-rc.1` | ✅ 需要本仓库 ≥ 0.3.0；0.2.0 及更早的门卫版本登录后首页与全部 `/api` 一律 401 |
 | `0.1.5-alpha.1` ~ `0.1.5-rc.1` | ✅ 已逐包核对 + 真机端到端实测（见下），无需改门卫配置 |
-| `0.1.7-rc.1` | ✅ **当前发布版本**（本仓库版本号同为 `0.1.7-rc.1`）；已逐包核对 + 回归固化（见下） |
+| `0.1.7-rc.1` | ✅ 已逐包核对 + 回归固化（见下） |
+| `0.2.0-rc.1` | ✅ **当前适配目标**（本仓库版本号同为 `0.2.0-rc.1`）；宿主鉴权契约零漂移，真机闸放行（见下） |
 
 升级 dsh 后无需改动门卫配置：令牌交换由门卫自动完成，浏览器首次访问首页时静默换取宿主会话。
 
@@ -316,6 +319,31 @@ rm -rf ~/.dsh-login-gateway/
   （`hmr watchConfig` 监听 patch 文件与 profile manifest 变化触发 reconcile），无需额外适配。
 
 测试：`pnpm test`（124 例全绿，其中 `test/host-auth-017.test.js` 8 例为 0.1.7 形状回归）。
+
+### dsh 0.2.0-rc.1 适配结论
+
+对 0.2.0-rc.1（桌面端 `D:\DeepSeek Harness`，`FileVersion 0.2.0-rc.1`）做了逐包源码比对 +
+**真机闸实测**，要点：
+
+- **宿主鉴权契约零漂移**（与 0.1.7 逐字一致，0.2.0 未触碰该面）：`TOKEN_QUERY = "token"`、
+  `COOKIE_PREFIX = "dsh-auth-"`、`authenticatedUrl(baseUrl)`、`authorizeIndex` 的
+  `GET /` + 单 token → `303` + `Set-Cookie`、401 文案
+  `dsh web authentication required; reopen the URL printed by dsh web.`、
+  `isLoopbackHostname` / `isTrustedAuthority` 围栏形状、client 侧
+  `isLoopback` 兜底入口与 `$host`/`hostFacts` 缓存 —— 全部未变，门卫三条链（代跑交换 /
+  401 自愈 / 登出连带吊销）无需改动。
+- **`configForms` 服务仍在**：`ctx.remote.$host.isLoopback ? "host" : "memory"` 判定语句、
+  `persistence` + `mirror` 两个字段名均与 0.1.7 相同，client bundle 兜底无需再改。
+- **唯一实质改动是兼容区间**：原三 clause 区间在 0.2.0-rc.1 下被启动闸拒绝
+  （`skipping profile bundle "dsh-login-gateway"`），插件**整个 bundle 不加载**。
+  新增第四段 `|| >=0.2.0-alpha.0 <0.3.0` 后放行。
+- **真机闸实测**（用宿主自带 app-boot 的真实判定函数，非自写模拟）：
+  `evaluatePluginCompatibility(manifest, {}, '0.2.0-rc.1')` → `undefined`（放行）；
+  修复前返回被拒 peer 清单。`dsh --profile web --dump-config` 的 stderr 中门卫一行消失，
+  dump 里 `login-gateway` 行存在且未 `disabled`。
+- **区间只放行 0.2.x 全系**，`0.3.0` 仍被拒，`0.1.8` 仍被拒（守卫测试固化）。
+
+测试：`node --test`（126 例全绿，新增 2 例为 0.2.0 区间与 semver 判定回归）。
 
 ## 供应链约束（无安装脚本 / 无 gyp / 预编译随包）
 

@@ -172,3 +172,73 @@ test('engines 必须显式覆盖 0.1.5 与 0.1.7 预发布段（本仓的目标 
   assert.match(range, />=\s*0\.1\.5-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.1.5 预发布下界')
   assert.match(range, />=\s*0\.1\.7-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.1.7 预发布下界')
 })
+
+test('引擎与 peer 区间必须显式覆盖 0.2.0 预发布段（本仓当前的 dsh 目标版本）', () => {
+  const range = pkg.dsh?.engines?.dsh ?? ''
+  assert.match(range, />=\s*0\.2\.0-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.2.0 预发布下界')
+  // 兼容闸（app-boot 的 evaluatePluginCompatibility）**只**读 peerDependencies 里
+  // @deepseek-ai/dsh* 的条目，从不读 dsh.engines.dsh——peer 写错时 engines 再对也不放行，
+  // 反之 peer 对了 engines 落后只会让安装期 pnpm 误拒。两者必须逐字一致。
+  assert.equal(
+    pkg.peerDependencies['@deepseek-ai/dsh'], range,
+    'peerDependencies["@deepseek-ai/dsh"] 必须与 dsh.engines.dsh 一致（闸只认前者）',
+  )
+  // 上界不得放开到 0.3.0：新区间只放行 0.2.x 全系。
+  assert.match(range, /<\s*0\.3\.0\s*$/, '末段上界须为 <0.3.0')
+})
+
+test('peer 区间在 dsh 侧判定下只放行 0.2.x 全系，不误开 0.3.0', () => {
+  // 逐字复刻宿主判定：semver.satisfies(runtime, range, { includePrerelease: true })。
+  // 这里手写最小比较器，避免本仓零依赖约束被测试打破。
+  const parse = (v) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(v)
+    if (!m) throw new Error(`无法解析版本：${v}`)
+    return { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] ?? null }
+  }
+  const cmp = (a, b) => {
+    for (const k of ['major', 'minor', 'patch']) if (a[k] !== b[k]) return a[k] < b[k] ? -1 : 1
+    if (a.pre === b.pre) return 0
+    if (a.pre === null) return 1
+    if (b.pre === null) return -1
+    const an = a.pre.split('.'), bn = b.pre.split('.')
+    for (let i = 0; i < Math.max(an.length, bn.length); i++) {
+      const x = an[i], y = bn[i]
+      if (x === undefined) return -1
+      if (y === undefined) return 1
+      const nx = /^\d+$/.test(x), ny = /^\d+$/.test(y)
+      if (nx && ny) { if (+x !== +y) return +x < +y ? -1 : 1; continue }
+      if (nx !== ny) return nx ? -1 : 1
+      if (x !== y) return x < y ? -1 : 1
+    }
+    return 0
+  }
+  const range = pkg.peerDependencies['@deepseek-ai/dsh']
+  const clauses = range.split('||').map((c) => {
+    const [lo, hi] = c.trim().split(/\s+/)
+    return { lo: parse(lo.slice(2)), hi: parse(hi.slice(1)) }
+  })
+  const satisfies = (host) => {
+    const v = parse(host)
+    return clauses.some(({ lo, hi }) => {
+      if (cmp(v, lo) < 0 || cmp(v, hi) >= 0) return false
+      // includePrerelease:true 下，区间内的预发布（无论上下界）都算数
+      if (v.pre === null) return true
+      const sameTuple = (b) => b.pre !== null && b.major === v.major && b.minor === v.minor && b.patch === v.patch
+      return sameTuple(lo) || sameTuple(hi)
+    })
+  }
+
+  // 必须在 0.2.0-rc.1（本仓当前适配目标）下放行
+  assert.equal(satisfies('0.2.0-rc.1'), true, '区间必须放行 0.2.0-rc.1')
+  for (const h of ['0.2.0-alpha.0', '0.2.0', '0.2.3']) {
+    assert.equal(satisfies(h), true, `区间必须放行 0.2.x：${h}`)
+  }
+  // 旧目标版本不能被这次改动弄丢
+  for (const h of ['0.1.2-alpha.3', '0.1.5-rc.1', '0.1.7-rc.1', '0.1.7-rc.2']) {
+    assert.equal(satisfies(h), true, `回归：区间必须继续放行 ${h}`)
+  }
+  // 反证：0.3.0 与旧版不能误放
+  for (const h of ['0.3.0', '0.1.1-rc.1', '0.1.8']) {
+    assert.equal(satisfies(h), false, `区间不得放行 ${h}`)
+  }
+})

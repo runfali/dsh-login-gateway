@@ -173,9 +173,12 @@ test('engines 必须显式覆盖 0.1.5 与 0.1.7 预发布段（本仓的目标 
   assert.match(range, />=\s*0\.1\.7-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.1.7 预发布下界')
 })
 
-test('引擎与 peer 区间必须显式覆盖 0.2.0 预发布段（本仓当前的 dsh 目标版本）', () => {
+test('引擎与 peer 区间必须显式覆盖 0.2.0 与 0.2.1 预发布段（本仓当前的 dsh 目标版本）', () => {
   const range = pkg.dsh?.engines?.dsh ?? ''
   assert.match(range, />=\s*0\.2\.0-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.2.0 预发布下界')
+  // 0.2.1 段（2026-10-19 补）：桌面运行时已到 0.2.1-rc.2。缺该段时宿主闸靠
+  // includePrerelease 侥幸放行（实测 PASS），但 pnpm 严格模式会拒——安装期与启动期分叉。
+  assert.match(range, />=\s*0\.2\.1-(alpha|beta|rc)\.\d+/, 'engines 需显式包含 0.2.1 预发布下界')
   // 兼容闸（app-boot 的 evaluatePluginCompatibility）**只**读 peerDependencies 里
   // @deepseek-ai/dsh* 的条目，从不读 dsh.engines.dsh——peer 写错时 engines 再对也不放行，
   // 反之 peer 对了 engines 落后只会让安装期 pnpm 误拒。两者必须逐字一致。
@@ -188,8 +191,12 @@ test('引擎与 peer 区间必须显式覆盖 0.2.0 预发布段（本仓当前�
 })
 
 test('peer 区间在 dsh 侧判定下只放行 0.2.x 全系，不误开 0.3.0', () => {
-  // 逐字复刻宿主判定：semver.satisfies(runtime, range, { includePrerelease: true })。
-  // 这里手写最小比较器，避免本仓零依赖约束被测试打破。
+  // ⚠️ 模式说明（2026-10-19 补，勿删）：下面这段手写 satisfies **建模的是严格模式**
+  // （比较器 + 预发布可见性规则），**不是**宿主闸的 includePrerelease 纯比较器模式——
+  // 尽管原注释曾如此声称。实测（逐版本跑真 semver 对照）两者在「上界自身的预发布」上分叉：
+  //   0.2.1-rc.2 / 0.3.0-alpha.0 → 本函数 false，宿主闸 true。
+  // 方向是安全的：严格 ⊂ 宿主闸放行集，所以「本守护通过 ⇒ 宿主闸必通过」，
+  // 不会出现「测试绿但真机被拒」。但**不能**据此断言「某版本必被宿主闸拒」。
   const parse = (v) => {
     const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(v)
     if (!m) throw new Error(`无法解析版本：${v}`)
@@ -228,9 +235,11 @@ test('peer 区间在 dsh 侧判定下只放行 0.2.x 全系，不误开 0.3.0', 
     })
   }
 
-  // 必须在 0.2.0-rc.1（本仓当前适配目标）下放行
+  // 必须在 0.2.1-rc.2（本仓当前适配目标 = 桌面运行时实测版本）下放行
+  assert.equal(satisfies('0.2.1-rc.2'), true, '区间必须放行 0.2.1-rc.2')
+  assert.equal(satisfies('0.2.1-rc.1'), true, '区间必须放行 0.2.1-rc.1')
   assert.equal(satisfies('0.2.0-rc.1'), true, '区间必须放行 0.2.0-rc.1')
-  for (const h of ['0.2.0-alpha.0', '0.2.0', '0.2.3']) {
+  for (const h of ['0.2.1-alpha.1', '0.2.1', '0.2.0-alpha.0', '0.2.0', '0.2.3']) {
     assert.equal(satisfies(h), true, `区间必须放行 0.2.x：${h}`)
   }
   // 旧目标版本不能被这次改动弄丢

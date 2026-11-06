@@ -251,7 +251,7 @@ rm -rf ~/.dsh-login-gateway/
 ## 版本兼容
 
 插件在 `package.json` 中声明了 `dsh.engines.dsh` 与 `peerDependencies["@deepseek-ai/dsh"]`
-（均为 `>=0.1.2-alpha.3 <0.1.8 || >=0.1.5-alpha.1 <0.1.6 || >=0.1.7-alpha.0 <0.1.8 || >=0.2.0-alpha.0 <0.3.0 || >=0.2.1-alpha.0 <0.3.0`）
+（均为 `>=0.1.2-alpha.3 <0.1.8 || >=0.1.5-alpha.1 <0.1.6 || >=0.1.7-alpha.0 <0.1.8 || >=0.2.0-alpha.0 <0.3.0 || >=0.2.1-alpha.0 <0.3.0 || >=0.2.2-alpha.0 <0.3.0`）
 与 `engines.node`（`^22.19.0 || >=24.0.0`）。
 
 > **0.1.7 起声明不再是纯语义**：dsh 在安装期（插件管理器 preflight）与启动期（profile
@@ -259,7 +259,7 @@ rm -rf ~/.dsh-login-gateway/
 > 不匹配的插件会被拒绝安装或拒绝挂载。**闸只读 `peerDependencies`，从不读 `dsh.engines.dsh`**，
 > 两者必须逐字一致（`test/supply-chain.test.js` 守护）。宿主侧判定带 `includePrerelease`，
 > 而 pnpm 安装期是严格 semver——预发布版必须有**同元组**预发布下界才被满足，所以
-> 0.1.5-`rc.*`、0.1.7-`rc.*`、0.2.0-`rc.*`、0.2.1-`rc.*` 各有自己的 clause。
+> 0.1.5-`rc.*`、0.1.7-`rc.*`、0.2.0-`rc.*`、0.2.1-`rc.*`、0.2.2-`rc.*` 各有自己的 clause。
 > 上界 `<0.1.8` / `<0.3.0` 让未来的 `0.1.8-*` 与 `0.3.0-*` 必须先验证再放行。
 
 | dsh | 状态 |
@@ -269,9 +269,44 @@ rm -rf ~/.dsh-login-gateway/
 | `0.1.5-alpha.1` ~ `0.1.5-rc.1` | ✅ 已逐包核对 + 真机端到端实测（见下），无需改门卫配置 |
 | `0.1.7-rc.1` | ✅ 已逐包核对 + 回归固化（见下） |
 | `0.2.0-rc.*` | ✅ 宿主鉴权契约零漂移，真机闸放行 |
-| `0.2.1-rc.*` | ✅ **当前适配目标**（本仓库版本号同为 `0.2.1-rc.2`）；真机闸放行（见下） |
+| `0.2.1-rc.*` | ✅ 已适配（宿主鉴权契约零漂移，真机闸放行） |
+| `0.2.2-rc.*` | ✅ **当前适配目标**（本仓库版本号同为 `0.2.2-rc.1`）；真机闸放行（见下） |
 
 升级 dsh 后无需改动门卫配置：令牌交换由门卫自动完成，浏览器首次访问首页时静默换取宿主会话。
+
+### dsh 0.2.2-rc.1 适配结论（2026-11-06）
+
+对宿主运行时 `@deepseek-ai/dsh-desktop-runtime` **0.2.2-rc.1** 做了 asar 解包逐包源码比对 +
+**宿主自带判定函数实测**（`evaluatePluginCompatibility` / `getDshRuntimeVersion`），要点：
+
+- **web 端反代目标端口仍是 3080，无需改动**：`dsh-web-app/cordis.patch.yml:180` 仍是
+  `port: !!js ctx.webStartup.port ?? 3080`（`:179` `host: ... ?? '127.0.0.1'`），
+  `--port` 可覆盖但默认值未变。门卫 `targetPort: 3080` 的默认假设继续成立。
+  （对比：桌面端 `dsh-desktop-host` 自 0.2.1 起就是 `--port 0` 随机端口，靠
+  `webServer.port` 回读；web 端**没有**这个变化。）
+- **兼容区间补 0.2.2 段**：宿主自带 `evaluatePluginCompatibility` 实测——**旧区间在
+  0.2.2-rc.1 下同样 PASS**（宿主闸带 `includePrerelease`，`<0.3.0` 会放行 0.2.2-rc.1），
+  所以不是「不补就挂不上」。补的理由仍是 **pnpm 安装期严格 semver 会拒**
+  （`0.2.2-rc.1` 判定为 `strict=false / host=true`）——安装期与启动期分叉，
+  补后两模式一致为 `true`。`0.3.0` 仍被真闸拒（真负例）。
+- **宿主鉴权契约零漂移**（行号均 0.2.2-rc.1 的 `dsh-client-connection/lib/index.js`）：
+  `:277` `COOKIE_PREFIX = "dsh-auth-"`；`:335-337` `cookieName(authority) = prefix + base64url(sha256(authority))`；
+  `:307-316` `requestAudience()` —— **http 取 `url.host`，仅 secure 取 `url.origin`**
+  （门卫→宿主走 http，故按 `targetHost:targetPort` 反推 cookie 名仍正确）；
+  `:440-444` `authenticatedUrl()` 仍只加 `token` 参数；`:458-470` `authorizeIndex`
+  仍是 `GET /` + 单 token → `303` + `Set-Cookie`；`:743-749` `admit()` 仍是
+  「不可信 → 403 / 无记录 → 401」。门卫三条链（代跑交换 / 401 自愈 / 登出连带吊销）零改动。
+- **信任围栏形状未变**（`:240-249` `isTrustedApiRequest`，`:201-207` `isTrustedAuthority`，
+  `:225-231` `isBindAddressAuthority`，`:258-269` `isSameAuthorityOrigin`）——
+  「改写三头」方案依然必需且有效。
+- **client bundle 零改动**：`dsh-client-connection/lib/client.browser.js:1421-1424` 的
+  connection handle 仍是字面量对象、`isLoopback` 可写；`dsh-api-gateway/lib/client.browser.js:1661-1667`
+  `get $host()` 仍返回 `{home, isLoopback}` 且缓存键仍是 `home`；`__ModuleLoader__` 未变。
+- **判定闸源码位置（供复核）**：`dsh-app-boot/lib/index.js:1097-1116` `unmetRequirements()`
+  （顶层 `engines.dsh` 优先，否则逐条 peer）、`:1094` `satisfies()` 带 `{includePrerelease:true}`、
+  `:1129` `evaluatePluginCompatibility()`（返回 `undefined` = PASS）、`:1089` `getDshRuntimeVersion()`。
+
+测试：`node --test`（**126 例全绿 / 0 跳过**）。
 
 ### dsh 0.2.1-rc.2 适配结论（2026-10-19）
 
